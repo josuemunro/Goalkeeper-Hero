@@ -11,7 +11,8 @@ const CANVAS_HEIGHT = 450;
 let Engine, Runner, World, Bodies, Composite, Constraint, Events, Body;
 
 // Game element properties
-const BALL_RADIUS = 15; // Initial visual radius on canvas
+const BALL_INITIAL_RADIUS = 20; // WAS: BALL_RADIUS = 15. Let's make it bigger.
+const BALL_MIN_SCALE = 0.65; // WAS: an effective 0.3. Let's make it end much bigger.
 const GOAL_WIDTH = 250;
 
 // Collision Categories
@@ -31,6 +32,8 @@ const KEEPER_UPPER_ARM_LENGTH = 40;
 const KEEPER_LOWER_ARM_LENGTH = 35;
 const KEEPER_UPPER_LEG_LENGTH = 45;
 const KEEPER_LOWER_LEG_LENGTH = 40;
+const KEEPER_REACTION_FORCE = 0.85; // Adjust this to make the keeper faster/slower
+const KEEPER_ARM_REACH_FORCE = 0.003; // A small, continuous force to pull the arm
 
 // To hold goalkeeper parts (bodies and constraints)
 let goalkeeper = {
@@ -42,7 +45,10 @@ let goalkeeper = {
   leftArm: { upper: null, lower: null },
   rightArm: { upper: null, lower: null },
   leftLeg: { upper: null, lower: null },
-  rightLeg: { upper: null, lower: null }
+  rightLeg: { upper: null, lower: null },
+  isSaving: false,
+  reachTarget: null, // {x, y} coordinates of where to reach
+  reachingHand: null // which body part is reaching (e.g., lowerLeftArm)
 };
 
 // Collision group for ragdoll parts to prevent self-collision
@@ -114,14 +120,14 @@ function initPhysics() {
   // Adjust Y and height based on your goal image and desired perspective.
   const platformY = CANVAS_HEIGHT * 0.6; // Example: 70% down the canvas
   const platformHeight = 20;
-  keeperPlatform = Bodies.rectangle(CANVAS_WIDTH / 2, platformY, GOAL_WIDTH * 1.2, platformHeight, { // Slightly wider than goal
-      isStatic: true,
-      label: 'keeperPlatform',
-      render: { visible: false }, // INVISIBLE
-      collisionFilter: {
-          category: KEEPER_PLATFORM_CATEGORY,
-          mask: KEEPER_CATEGORY // Only collides with the keeper
-      }
+  keeperPlatform = Bodies.rectangle(CANVAS_WIDTH / 2, platformY, CANVAS_WIDTH, platformHeight, {
+    isStatic: true,
+    label: 'keeperPlatform',
+    render: { visible: false }, // INVISIBLE
+    collisionFilter: {
+      category: KEEPER_PLATFORM_CATEGORY,
+      mask: KEEPER_CATEGORY // Only collides with the keeper
+    }
   });
   Composite.add(engine.world, [keeperPlatform]);
 
@@ -135,22 +141,22 @@ function initPhysics() {
 
 function createPhysicalBalls() {
   ballsData.forEach(ballInfo => {
-      const ballBody = Bodies.circle(ballInfo.initialX, ballInfo.initialY, BALL_RADIUS, {
-          isStatic: true,
-          isSensor: true, // Sensor during flight
-          restitution: 0.5,
-          friction: 0.05,
-          label: `ball-${ballInfo.id}`,
-          collisionFilter: {
-              category: BALL_CATEGORY,
-              // Mask: will collide with KEEPER for saves, and DEFAULT for world boundaries
-              // For now, let's assume DEFAULT_CATEGORY might represent edges if we add them
-              // Balls should NOT collide with KEEPER_PLATFORM
-              mask: KEEPER_CATEGORY | DEFAULT_CATEGORY
-          },
-          renderProps: { fillStyle: '#FFFFFF', strokeStyle: '#333333', lineWidth: 2 }
-      });
-      ballInfo.matterBody = ballBody;
+    const ballBody = Bodies.circle(ballInfo.initialX, ballInfo.initialY, BALL_INITIAL_RADIUS, {
+      isStatic: true,
+      isSensor: true, // Sensor during flight
+      restitution: 0.5,
+      friction: 0.05,
+      label: `ball-${ballInfo.id}`,
+      collisionFilter: {
+        category: BALL_CATEGORY,
+        // Mask: will collide with KEEPER for saves, and DEFAULT for world boundaries
+        // For now, let's assume DEFAULT_CATEGORY might represent edges if we add them
+        // Balls should NOT collide with KEEPER_PLATFORM
+        mask: KEEPER_CATEGORY | DEFAULT_CATEGORY
+      },
+      renderProps: { fillStyle: '#FFFFFF', strokeStyle: '#333333', lineWidth: 2 }
+    });
+    ballInfo.matterBody = ballBody;
   });
   Composite.add(engine.world, ballsData.map(b => b.matterBody));
 }
@@ -196,6 +202,10 @@ function handleShoot(ballId) {
     ballInfo.shootTargetX = CANVAS_WIDTH / 2 + (Math.random() - 0.5) * goalVisualWidth * 0.8;
     ballInfo.shootTargetY = goalVisualCenterY;
 
+    // TRIGGER THE KEEPER'S REACTION
+    keeperAttemptSave(ballInfo.shootTargetX, ballInfo.shootTargetY);
+
+
     // The actual animation will happen in gameLoop
   }
 }
@@ -207,27 +217,27 @@ function createGoalkeeper() {
   const initialY = goalFloorY - (KEEPER_LOWER_LEG_LENGTH + KEEPER_UPPER_LEG_LENGTH + KEEPER_TORSO_HEIGHT * 0.25); // Position above platform
 
   const commonBodyOptions = {
-      // Keeper parts should collide with the platform and eventually balls.
-      // They should NOT collide with each other (due to RAGDOLL_COLLISION_GROUP).
-      collisionFilter: {
-          group: RAGDOLL_COLLISION_GROUP,
-          category: KEEPER_CATEGORY,
-          mask: KEEPER_PLATFORM_CATEGORY | BALL_CATEGORY /* | DEFAULT_CATEGORY */ // Add BALL_CATEGORY later for saves
-      },
-      density: 0.005,
-      restitution: 0.1,
-      friction: 0.8,
-      renderProps: {
-          fillStyle: KEEPER_PART_COLOR,
-          strokeStyle: KEEPER_STROKE_COLOR,
-          lineWidth: 2
-      }
+    // Keeper parts should collide with the platform and eventually balls.
+    // They should NOT collide with each other (due to RAGDOLL_COLLISION_GROUP).
+    collisionFilter: {
+      group: RAGDOLL_COLLISION_GROUP,
+      category: KEEPER_CATEGORY,
+      mask: KEEPER_PLATFORM_CATEGORY | BALL_CATEGORY /* | DEFAULT_CATEGORY */ // Add BALL_CATEGORY later for saves
+    },
+    density: 0.005,
+    restitution: 0.1,
+    friction: 0.8,
+    renderProps: {
+      fillStyle: KEEPER_PART_COLOR,
+      strokeStyle: KEEPER_STROKE_COLOR,
+      lineWidth: 2
+    }
   };
 
   const commonConstraintOptions = {
-      stiffness: 0.9,
-      damping: 0.2,
-      render: { /* visible: true, lineWidth:1, strokeStyle:'#00FF00' */ }
+    stiffness: 0.9,
+    damping: 0.2,
+    render: { /* visible: true, lineWidth:1, strokeStyle:'#00FF00' */ }
   };
 
   // --- TORSO ---
@@ -239,10 +249,10 @@ function createGoalkeeper() {
   const head = Bodies.circle(initialX, headInitialY, KEEPER_HEAD_RADIUS, { ...commonBodyOptions, label: "head" });
   goalkeeper.head = head;
   const neck = Constraint.create({
-      bodyA: torso, bodyB: head,
-      pointA: { x: 0, y: -KEEPER_TORSO_HEIGHT / 2 },
-      pointB: { x: 0, y: KEEPER_HEAD_RADIUS * 0.5 },
-      length: 1, stiffness: 0.95, ...commonConstraintOptions
+    bodyA: torso, bodyB: head,
+    pointA: { x: 0, y: -KEEPER_TORSO_HEIGHT / 2 },
+    pointB: { x: 0, y: KEEPER_HEAD_RADIUS * 0.5 },
+    length: 1, stiffness: 0.95, ...commonConstraintOptions
   });
 
   // --- ARMS --- (Kept previous refinements, ensure collisionFilter is applied)
@@ -253,8 +263,8 @@ function createGoalkeeper() {
   goalkeeper.leftArm.upper = upperLeftArm;
   const leftShoulder = Constraint.create({ bodyA: torso, bodyB: upperLeftArm, pointA: { x: -KEEPER_TORSO_WIDTH / 2, y: -KEEPER_TORSO_HEIGHT / 2 + KEEPER_LIMB_WIDTH * 1.5 }, pointB: { x: KEEPER_UPPER_ARM_LENGTH / 2, y: 0 }, length: KEEPER_LIMB_WIDTH / 2, ...commonConstraintOptions });
 
-  const upperLeftArmEndX = upperLeftArm.position.x - KEEPER_UPPER_ARM_LENGTH / 2 * Math.cos(upperLeftArm.angle) ;
-  const upperLeftArmEndY = upperLeftArm.position.y - KEEPER_UPPER_ARM_LENGTH / 2 * Math.sin(upperLeftArm.angle) ;
+  const upperLeftArmEndX = upperLeftArm.position.x - KEEPER_UPPER_ARM_LENGTH / 2 * Math.cos(upperLeftArm.angle);
+  const upperLeftArmEndY = upperLeftArm.position.y - KEEPER_UPPER_ARM_LENGTH / 2 * Math.sin(upperLeftArm.angle);
   const lowerLeftArm = Bodies.rectangle(upperLeftArmEndX - KEEPER_LOWER_ARM_LENGTH / 2, upperLeftArmEndY, KEEPER_LOWER_ARM_LENGTH, KEEPER_LIMB_WIDTH, { ...commonBodyOptions, label: "lowerLeftArm" });
   goalkeeper.leftArm.lower = lowerLeftArm;
   const leftElbow = Constraint.create({ bodyA: upperLeftArm, bodyB: lowerLeftArm, pointA: { x: -KEEPER_UPPER_ARM_LENGTH / 2, y: 0 }, pointB: { x: KEEPER_LOWER_ARM_LENGTH / 2, y: 0 }, length: KEEPER_LIMB_WIDTH / 2, ...commonConstraintOptions });
@@ -263,8 +273,8 @@ function createGoalkeeper() {
   goalkeeper.rightArm.upper = upperRightArm;
   const rightShoulder = Constraint.create({ bodyA: torso, bodyB: upperRightArm, pointA: { x: KEEPER_TORSO_WIDTH / 2, y: -KEEPER_TORSO_HEIGHT / 2 + KEEPER_LIMB_WIDTH * 1.5 }, pointB: { x: -KEEPER_UPPER_ARM_LENGTH / 2, y: 0 }, length: KEEPER_LIMB_WIDTH / 2, ...commonConstraintOptions });
 
-  const upperRightArmEndX = upperRightArm.position.x + KEEPER_UPPER_ARM_LENGTH / 2 * Math.cos(upperRightArm.angle) ;
-  const upperRightArmEndY = upperRightArm.position.y + KEEPER_UPPER_ARM_LENGTH / 2 * Math.sin(upperRightArm.angle) ;
+  const upperRightArmEndX = upperRightArm.position.x + KEEPER_UPPER_ARM_LENGTH / 2 * Math.cos(upperRightArm.angle);
+  const upperRightArmEndY = upperRightArm.position.y + KEEPER_UPPER_ARM_LENGTH / 2 * Math.sin(upperRightArm.angle);
   const lowerRightArm = Bodies.rectangle(upperRightArmEndX + KEEPER_LOWER_ARM_LENGTH / 2, upperRightArmEndY, KEEPER_LOWER_ARM_LENGTH, KEEPER_LIMB_WIDTH, { ...commonBodyOptions, label: "lowerRightArm" });
   goalkeeper.rightArm.lower = lowerRightArm;
   const rightElbow = Constraint.create({ bodyA: upperRightArm, bodyB: lowerRightArm, pointA: { x: KEEPER_UPPER_ARM_LENGTH / 2, y: 0 }, pointB: { x: -KEEPER_LOWER_ARM_LENGTH / 2, y: 0 }, length: KEEPER_LIMB_WIDTH / 2, ...commonConstraintOptions });
@@ -280,22 +290,22 @@ function createGoalkeeper() {
   const upperLeftLeg = Bodies.rectangle(upperLeftLegInitialX, initialY + legYOffset + KEEPER_UPPER_LEG_LENGTH / 2, KEEPER_LIMB_WIDTH, KEEPER_UPPER_LEG_LENGTH, { ...commonBodyOptions, label: "upperLeftLeg" });
   goalkeeper.leftLeg.upper = upperLeftLeg;
   const leftHip = Constraint.create({
-      bodyA: torso, bodyB: upperLeftLeg,
-      pointA: { x: -upperLegX * 0.75, y: KEEPER_TORSO_HEIGHT / 2 }, // Adjusted hip joint on torso slightly inwards
-      pointB: { x: 0, y: -KEEPER_UPPER_LEG_LENGTH / 2 },
-      length: KEEPER_LIMB_WIDTH, stiffness: 0.95, // INCREASED HIP STIFFNESS
-      ...commonConstraintOptions // inherits damping
+    bodyA: torso, bodyB: upperLeftLeg,
+    pointA: { x: -upperLegX * 0.75, y: KEEPER_TORSO_HEIGHT / 2 }, // Adjusted hip joint on torso slightly inwards
+    pointB: { x: 0, y: -KEEPER_UPPER_LEG_LENGTH / 2 },
+    length: KEEPER_LIMB_WIDTH, stiffness: 0.95, // INCREASED HIP STIFFNESS
+    ...commonConstraintOptions // inherits damping
   });
 
   const lowerLeftLegInitialX = upperLeftLegInitialX - 2; // Slightly offset lower leg outward
   const lowerLeftLeg = Bodies.rectangle(lowerLeftLegInitialX, initialY + legYOffset + KEEPER_UPPER_LEG_LENGTH + KEEPER_LOWER_LEG_LENGTH / 2, KEEPER_LIMB_WIDTH, KEEPER_LOWER_LEG_LENGTH, { ...commonBodyOptions, label: "lowerLeftLeg" });
   goalkeeper.leftLeg.lower = lowerLeftLeg;
   const leftKnee = Constraint.create({
-      bodyA: upperLeftLeg, bodyB: lowerLeftLeg,
-      pointA: { x: 0, y: KEEPER_UPPER_LEG_LENGTH / 2 },
-      pointB: { x: 0, y: -KEEPER_LOWER_LEG_LENGTH / 2 },
-      length: 1, stiffness: 0.95, // INCREASED KNEE STIFFNESS
-      ...commonConstraintOptions
+    bodyA: upperLeftLeg, bodyB: lowerLeftLeg,
+    pointA: { x: 0, y: KEEPER_UPPER_LEG_LENGTH / 2 },
+    pointB: { x: 0, y: -KEEPER_LOWER_LEG_LENGTH / 2 },
+    length: 1, stiffness: 0.95, // INCREASED KNEE STIFFNESS
+    ...commonConstraintOptions
   });
 
   // RIGHT LEG (mirror)
@@ -303,22 +313,22 @@ function createGoalkeeper() {
   const upperRightLeg = Bodies.rectangle(upperRightLegInitialX, initialY + legYOffset + KEEPER_UPPER_LEG_LENGTH / 2, KEEPER_LIMB_WIDTH, KEEPER_UPPER_LEG_LENGTH, { ...commonBodyOptions, label: "upperRightLeg" });
   goalkeeper.rightLeg.upper = upperRightLeg;
   const rightHip = Constraint.create({
-      bodyA: torso, bodyB: upperRightLeg,
-      pointA: { x: upperLegX * 0.75, y: KEEPER_TORSO_HEIGHT / 2 },
-      pointB: { x: 0, y: -KEEPER_UPPER_LEG_LENGTH / 2 },
-      length: KEEPER_LIMB_WIDTH, stiffness: 0.95, // INCREASED HIP STIFFNESS
-      ...commonConstraintOptions
+    bodyA: torso, bodyB: upperRightLeg,
+    pointA: { x: upperLegX * 0.75, y: KEEPER_TORSO_HEIGHT / 2 },
+    pointB: { x: 0, y: -KEEPER_UPPER_LEG_LENGTH / 2 },
+    length: KEEPER_LIMB_WIDTH, stiffness: 0.95, // INCREASED HIP STIFFNESS
+    ...commonConstraintOptions
   });
 
   const lowerRightLegInitialX = upperRightLegInitialX + 2; // Slightly offset lower leg outward
   const lowerRightLeg = Bodies.rectangle(lowerRightLegInitialX, initialY + legYOffset + KEEPER_UPPER_LEG_LENGTH + KEEPER_LOWER_LEG_LENGTH / 2, KEEPER_LIMB_WIDTH, KEEPER_LOWER_LEG_LENGTH, { ...commonBodyOptions, label: "lowerRightLeg" });
   goalkeeper.rightLeg.lower = lowerRightLeg;
   const rightKnee = Constraint.create({
-      bodyA: upperRightLeg, bodyB: lowerRightLeg,
-      pointA: { x: 0, y: KEEPER_UPPER_LEG_LENGTH / 2 },
-      pointB: { x: 0, y: -KEEPER_LOWER_LEG_LENGTH / 2 },
-      length: 1, stiffness: 0.95, // INCREASED KNEE STIFFNESS
-      ...commonConstraintOptions
+    bodyA: upperRightLeg, bodyB: lowerRightLeg,
+    pointA: { x: 0, y: KEEPER_UPPER_LEG_LENGTH / 2 },
+    pointB: { x: 0, y: -KEEPER_LOWER_LEG_LENGTH / 2 },
+    length: 1, stiffness: 0.95, // INCREASED KNEE STIFFNESS
+    ...commonConstraintOptions
   });
 
   goalkeeper.bodies.length = 0; goalkeeper.constraints.length = 0;
@@ -327,6 +337,57 @@ function createGoalkeeper() {
 
   Composite.add(engine.world, goalkeeper.bodies);
   Composite.add(engine.world, goalkeeper.constraints);
+}
+
+function keeperAttemptSave(targetX, targetY) {
+  if (!goalkeeper.torso) return; // Can't do anything if there's no keeper
+
+  // Set keeper state
+  goalkeeper.isSaving = true;
+  goalkeeper.reachTarget = { x: targetX, y: targetY };
+
+  // Decide which hand to use based on target's X position
+  if (targetX < goalkeeper.torso.position.x) {
+    goalkeeper.reachingHand = goalkeeper.leftArm.lower; // Reach with left hand
+  } else {
+    goalkeeper.reachingHand = goalkeeper.rightArm.lower; // Reach with right hand
+  }
+
+  // 1. Get current position of the keeper's torso
+  const keeperPosition = goalkeeper.torso.position;
+
+  // 2. Calculate the vector from the keeper to the target
+  const vectorToTarget = {
+    x: targetX - keeperPosition.x,
+    y: targetY - keeperPosition.y
+  };
+
+  // 3. Calculate the distance to normalize the vector
+  const distance = Math.sqrt(vectorToTarget.x * vectorToTarget.x + vectorToTarget.y * vectorToTarget.y);
+  if (distance === 0) return; // Avoid division by zero
+
+  const normalizedVector = {
+    x: vectorToTarget.x / distance,
+    y: vectorToTarget.y / distance
+  };
+
+  // 4. Calculate the force to apply
+  // The force magnitude needs to be enough to get him there in time.
+  // This requires tuning! We'll use our constant.
+  const force = {
+    x: normalizedVector.x * KEEPER_REACTION_FORCE,
+    y: normalizedVector.y * KEEPER_REACTION_FORCE
+  };
+
+  // 5. Apply the force to the keeper's torso
+  // This gives him a powerful push towards the ball's destination.
+  Body.applyForce(goalkeeper.torso, keeperPosition, force);
+
+  console.log(`Keeper reacting! Applying force {x: ${force.x.toFixed(4)}, y: ${force.y.toFixed(4)}}`);
+
+  // --- Future enhancements for this function ---
+  // - Apply upward force to feet for "jumping" if targetY is high.
+  // - Apply smaller forces to arms/hands to make them "reach".
 }
 
 // OUR CUSTOM GAME LOOP / RENDERER
@@ -376,20 +437,65 @@ function gameLoop() {
 
       if (distanceToTarget < animationSpeed) {
         // Reached target (or close enough) - this is the "SAVE" moment
-        Body.setPosition(body, { x: targetX, y: targetY }); // Snap to exact target
+        Body.setPosition(body, { x: targetX, y: targetY });
         ballInfo.isShooting = false;
-        ballInfo.currentScale = 0.3; // Smallest size at goal
+        ballInfo.currentScale = BALL_MIN_SCALE;
 
-        console.log(`${ballInfo.id} reached save point. Deflecting (simulated).`);
-        // TODO: Keeper interaction here. For now, make it dynamic and apply a random upward force.
-        Body.setStatic(body, false); // Make it dynamic
-        body.isSensor = false;       // Allow collisions
+        console.log(`${ballInfo.id} reached save point. Deflecting from keeper.`);
 
-        Body.setVelocity(body, { x: 0, y: 0 }); // Reset velocity before applying new force
-        Body.applyForce(body, body.position, {
-          x: (Math.random() - 0.5) * 0.1, // Random horizontal deflection
-          y: -0.05 // Upward deflection
-        });
+        // --- ROBUST DEFLECTION LOGIC ---
+        Body.setStatic(body, false);
+        body.isSensor = false;
+
+        // Reset ball's velocity to 0 before we apply new forces
+        Body.setVelocity(body, { x: 0, y: 0 });
+
+        // 1. Calculate a reliable "punch" direction away from the keeper
+        const keeperPosition = goalkeeper.torso.position;
+        const ballPosition = body.position;
+        let punchVector = {
+          x: ballPosition.x - keeperPosition.x,
+          y: ballPosition.y - keeperPosition.y
+        };
+        // Normalize the punch vector
+        const punchMagnitude = Math.sqrt(punchVector.x * punchVector.x + punchVector.y * punchVector.y);
+        if (punchMagnitude > 0) {
+          punchVector.x /= punchMagnitude;
+          punchVector.y /= punchMagnitude;
+        } else {
+          // Fallback if keeper and ball are at the exact same spot
+          punchVector = { x: (Math.random() - 0.5), y: -1 };
+        }
+
+
+        // 2. Create a base deflection force + add keeper's velocity as a bonus
+        // The user's tuned value (0.6) was probably high because velocity was low.
+        // Let's start with a reasonable base and smaller multiplier.
+        const deflectionForceMagnitude = 0.01; // Base strength of the "punch"
+        const keeperVelocityInfluence = 0.1; // How much keeper's motion adds
+
+        const deflectionForce = {
+          x: punchVector.x * deflectionForceMagnitude + (goalkeeper.torso.velocity.x * keeperVelocityInfluence),
+          y: punchVector.y * deflectionForceMagnitude - 0.03 // Add a consistent upward pop
+        };
+
+        Body.applyForce(body, body.position, deflectionForce);
+
+        // Reset the keeper's AI state
+        goalkeeper.isSaving = false;
+        goalkeeper.reachTarget = null;
+        goalkeeper.reachingHand = null;
+
+        // 3. Temporarily disable collision between ball and keeper to prevent tangling
+        body.collisionFilter.group = RAGDOLL_COLLISION_GROUP;
+
+        // 4. Re-enable collision after a short delay
+        setTimeout(() => {
+          // Make sure the body still exists before trying to modify it
+          if (body) {
+            body.collisionFilter.group = 0; // 0 is the default group, collides with everything
+          }
+        }, 500); // 500ms = half a second
 
         // TODO: Replace problem text on this ball for the next shot.
         // TODO: Show speech bubble with solution.
@@ -410,16 +516,17 @@ function gameLoop() {
         // Let's use a simpler approach for now: scale decreases as Y decreases (goes "up" the screen)
         const totalTravelY = ballInfo.initialY - targetY;
         const travelledY = ballInfo.initialY - newY;
-        if (totalTravelY > 0) { // Avoid division by zero, ensure moving towards target
+        if (totalTravelY > 0) {
           const progress = Math.max(0, Math.min(1, travelledY / totalTravelY));
-          ballInfo.currentScale = 1 - progress * 0.7; // Scale from 1 down to 0.3
+          // CHANGE IS HERE: use BALL_MIN_SCALE
+          ballInfo.currentScale = 1 - progress * (1 - BALL_MIN_SCALE);
         }
       }
     }
 
     // Draw the ball using its current scale
     ctx.beginPath();
-    ctx.arc(body.position.x, body.position.y, BALL_RADIUS * ballInfo.currentScale, 0, Math.PI * 2);
+    ctx.arc(body.position.x, body.position.y, BALL_INITIAL_RADIUS * ballInfo.currentScale, 0, Math.PI * 2);
     ctx.fillStyle = body.renderProps.fillStyle;
     ctx.fill();
     ctx.strokeStyle = body.renderProps.strokeStyle;
@@ -427,14 +534,22 @@ function gameLoop() {
     ctx.stroke();
     ctx.closePath();
 
-    // If ball flies off screen, reset it (basic reset logic for now)
-    if (!ballInfo.isShooting && body.position.y > CANVAS_HEIGHT + BALL_RADIUS * 2) {
+    const isOutOfYBounds = body.position.y > CANVAS_HEIGHT + 50 || body.position.y < -50;
+    const isOutOfXBounds = body.position.x > CANVAS_WIDTH + 50 || body.position.x < -50;
+
+    if (!ballInfo.isShooting && (isOutOfYBounds || isOutOfXBounds)) {
+      console.log(`Resetting ${ballInfo.id}`);
+      // Reset physics state
       Body.setStatic(body, true);
       body.isSensor = true;
       Body.setPosition(body, { x: ballInfo.initialX, y: ballInfo.initialY });
-      Body.setVelocity(body, { x: 0, y: 0 }); // Reset velocity
-      Body.setAngle(body, 0); // Reset angle
-      ballInfo.currentScale = 1; // Reset scale
+      Body.setVelocity(body, { x: 0, y: 0 });
+      Body.setAngle(body, 0);
+      Body.setAngularVelocity(body, 0);
+
+      // Reset visual/game state
+      ballInfo.currentScale = 1;
+
       // TODO: Get new problem for this ball.
     }
   });
@@ -454,7 +569,27 @@ function gameLoop() {
   }
   */
 
-  // 6. Draw goalkeeper
+  // 6. UPDATE KEEPER AI (e.g., Arm Stretching)
+  if (goalkeeper.isSaving && goalkeeper.reachTarget && goalkeeper.reachingHand) {
+    const hand = goalkeeper.reachingHand;
+    const target = goalkeeper.reachTarget;
+
+    // Apply a gentle, continuous force to pull the hand towards the target
+    const vectorToTarget = {
+      x: target.x - hand.position.x,
+      y: target.y - hand.position.y
+    };
+
+    const reachForce = {
+      x: vectorToTarget.x * KEEPER_ARM_REACH_FORCE,
+      y: vectorToTarget.y * KEEPER_ARM_REACH_FORCE
+    };
+
+    // Apply force to the "hand" (lower arm part)
+    Body.applyForce(hand, hand.position, reachForce);
+  }
+
+  // 7. Draw goalkeeper
   goalkeeper.bodies.forEach(body => {
     ctx.beginPath();
     // Assuming all keeper parts are rectangles for now, except head
@@ -475,7 +610,7 @@ function gameLoop() {
     ctx.stroke();
   });
 
-  // 7. Draw UI elements like speech bubble (later)
+  // 8. Draw UI elements like speech bubble (later)
 }
 
 
