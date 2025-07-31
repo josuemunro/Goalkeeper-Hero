@@ -3,9 +3,19 @@ const canvas = document.getElementById('gameCanvas');
 const ctx = canvas.getContext('2d'); // We WILL use this extensively now
 const ballControlsContainer = document.getElementById('ball-controls-container');
 
-// Define the canvas dimensions
-const CANVAS_WIDTH = 600;
-const CANVAS_HEIGHT = 450;
+// Define the canvas dimensions - now dynamic based on container
+function getCanvasDimensions() {
+  // Use container dimensions to avoid scrollbar issues
+  const container = canvas.parentElement;
+  return {
+    width: container ? container.clientWidth : window.innerWidth,
+    height: window.innerHeight * 0.75 // 75vh
+  };
+}
+
+// Get current canvas dimensions
+let CANVAS_WIDTH = getCanvasDimensions().width;
+let CANVAS_HEIGHT = getCanvasDimensions().height;
 
 // Matter.js Modules
 let Engine, Runner, World, Bodies, Composite, Constraint, Events, Body;
@@ -48,7 +58,12 @@ let goalkeeper = {
   rightLeg: { upper: null, lower: null },
   isSaving: false,
   reachTarget: null, // {x, y} coordinates of where to reach
-  reachingHand: null // which body part is reaching (e.g., lowerLeftArm)
+  reachingHand: null, // which body part is reaching (e.g., lowerLeftArm)
+  // Animation state system
+  animationState: 'ragdoll', // 'ragdoll', 'jumping', 'reaching', 'superman'
+  animationStartTime: 0,
+  animationDuration: 800, // How long animation lasts in ms
+  savedPositions: {} // Store original positions for pose restoration
 };
 
 // Collision group for ragdoll parts to prevent self-collision
@@ -59,11 +74,686 @@ let physicalBalls = [];
 let ground;
 let keeperPlatform;
 
-let ballsData = [
-  { id: 'ball1', problemText: "", initialX: CANVAS_WIDTH / 2 - 100, initialY: CANVAS_HEIGHT - 60, solutionText: "", matterBody: null, isShooting: false, shootTargetX: 0, shootTargetY: 0, currentScale: 1 },
-  { id: 'ball2', problemText: "", initialX: CANVAS_WIDTH / 2, initialY: CANVAS_HEIGHT - 60, solutionText: "", matterBody: null, isShooting: false, shootTargetX: 0, shootTargetY: 0, currentScale: 1 },
-  { id: 'ball3', problemText: "", initialX: CANVAS_WIDTH / 2 + 100, initialY: CANVAS_HEIGHT - 60, solutionText: "", matterBody: null, isShooting: false, shootTargetX: 0, shootTargetY: 0, currentScale: 1 }
-];
+// Speech bubble state
+let speechBubble = {
+  isVisible: false,
+  text: "",
+  opacity: 0,
+  targetOpacity: 0,
+  fadeSpeed: 0.05,
+  displayDuration: 4000, // 4 seconds
+  showStartTime: 0
+};
+
+// No more queue system - all shots fire immediately!
+
+// Mouse interaction system for draggable keeper
+let mouseInteraction = {
+  isDragging: false,
+  lastMouseX: 0,
+  lastMouseY: 0,
+  mouseHistory: [], // Track recent mouse positions for throw velocity
+  maxHistoryLength: 5,
+  followStrength: 0.03 // How strongly keeper follows mouse (0-1)
+};
+
+// Visual effects system
+let particles = [];
+
+class Particle {
+  constructor(x, y, vx, vy, life, color) {
+    this.x = x;
+    this.y = y;
+    this.vx = vx;
+    this.vy = vy;
+    this.life = life;
+    this.maxLife = life;
+    this.color = color;
+    this.size = Math.random() * 4 + 2;
+  }
+
+  update() {
+    this.x += this.vx;
+    this.y += this.vy;
+    this.vy += 0.2; // gravity
+    this.vx *= 0.98; // air resistance
+    this.life--;
+  }
+
+  draw(ctx) {
+    const alpha = this.life / this.maxLife;
+    ctx.save(); // Save current context state
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = this.color;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.size * alpha, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore(); // Restore context state
+  }
+
+  isDead() {
+    return this.life <= 0;
+  }
+}
+
+function createAerialAdjustmentEffect(x, y) {
+  // Create explosive particle effect
+  const particleCount = 15;
+  const colors = ['#FFD700', '#FFA500', '#FF6347', '#FFFFFF'];
+
+  for (let i = 0; i < particleCount; i++) {
+    const angle = (Math.PI * 2 * i) / particleCount + (Math.random() - 0.5) * 0.5;
+    const speed = Math.random() * 8 + 3;
+    const vx = Math.cos(angle) * speed;
+    const vy = Math.sin(angle) * speed - Math.random() * 2; // Slight upward bias
+    const life = Math.random() * 30 + 20;
+    const color = colors[Math.floor(Math.random() * colors.length)];
+
+    particles.push(new Particle(x, y, vx, vy, life, color));
+  }
+}
+
+function checkGoalkeeperBounds() {
+  if (!goalkeeper.torso) return;
+
+  const torso = goalkeeper.torso;
+  const boundaryBuffer = 250; // Increased buffer - more forgiving bounds
+
+  // Check if keeper is WAY out of bounds (not just a little bit)
+  const isWayOutOfBounds =
+    torso.position.x < -boundaryBuffer ||
+    torso.position.x > CANVAS_WIDTH + boundaryBuffer ||
+    torso.position.y < -boundaryBuffer ||
+    torso.position.y > CANVAS_HEIGHT + boundaryBuffer;
+
+  // Additional check: only reset if keeper is also moving away (not coming back)
+  const isMovingAwayFromCenter = false; // We'll calculate this
+
+  if (isWayOutOfBounds) {
+    // Give keeper a chance to come back naturally before forcing reset
+    const centerX = CANVAS_WIDTH / 2;
+    const centerY = CANVAS_HEIGHT / 2;
+    const distanceFromCenter = Math.sqrt(
+      (torso.position.x - centerX) ** 2 +
+      (torso.position.y - centerY) ** 2
+    );
+
+    // Scale the reset distance based on canvas size
+    const maxDistanceFromCenter = Math.max(CANVAS_WIDTH * 0.6, 400); // 60% of width or 400px minimum
+
+    if (distanceFromCenter > maxDistanceFromCenter) {
+      console.log(`Goalkeeper WAY out of bounds (${distanceFromCenter.toFixed(0)}px from center, max: ${maxDistanceFromCenter.toFixed(0)})! Gentle reset.`);
+      resetGoalkeeper();
+    }
+  }
+}
+
+function resetGoalkeeper() {
+  if (!goalkeeper.torso) return;
+
+  console.log('Gentle goalkeeper reset initiated...');
+
+  // Reset keeper position to center of goal
+  const resetX = CANVAS_WIDTH / 2;
+  const resetY = CANVAS_HEIGHT * 0.4; // Slightly higher than platform
+
+  // GENTLE RESET: First stop all motion, then gradually move to position
+  goalkeeper.bodies.forEach(body => {
+    Body.setVelocity(body, { x: 0, y: 0 });
+    Body.setAngularVelocity(body, 0);
+    // Reset any extreme angles to prevent constraint stress
+    if (Math.abs(body.angle) > Math.PI * 2) {
+      Body.setAngle(body, body.angle % (Math.PI * 2));
+    }
+  });
+
+  // Position ALL body parts relative to torso to prevent constraint stress
+  const torso = goalkeeper.torso;
+  Body.setPosition(torso, { x: resetX, y: resetY });
+  Body.setAngle(torso, 0); // Make torso upright
+
+  // Position head relative to torso
+  if (goalkeeper.head) {
+    Body.setPosition(goalkeeper.head, {
+      x: resetX,
+      y: resetY - 25 // Above torso
+    });
+    Body.setAngle(goalkeeper.head, 0);
+  }
+
+  // Position arms in natural hanging position
+  if (goalkeeper.leftArm.upper) {
+    Body.setPosition(goalkeeper.leftArm.upper, {
+      x: resetX - 25,
+      y: resetY - 15
+    });
+    Body.setAngle(goalkeeper.leftArm.upper, 0);
+  }
+
+  if (goalkeeper.leftArm.lower) {
+    Body.setPosition(goalkeeper.leftArm.lower, {
+      x: resetX - 35,
+      y: resetY + 15
+    });
+    Body.setAngle(goalkeeper.leftArm.lower, 0);
+  }
+
+  if (goalkeeper.rightArm.upper) {
+    Body.setPosition(goalkeeper.rightArm.upper, {
+      x: resetX + 25,
+      y: resetY - 15
+    });
+    Body.setAngle(goalkeeper.rightArm.upper, 0);
+  }
+
+  if (goalkeeper.rightArm.lower) {
+    Body.setPosition(goalkeeper.rightArm.lower, {
+      x: resetX + 35,
+      y: resetY + 15
+    });
+    Body.setAngle(goalkeeper.rightArm.lower, 0);
+  }
+
+  // Position legs in standing position
+  if (goalkeeper.leftLeg.upper) {
+    Body.setPosition(goalkeeper.leftLeg.upper, {
+      x: resetX - 15,
+      y: resetY + 35
+    });
+    Body.setAngle(goalkeeper.leftLeg.upper, 0);
+  }
+
+  if (goalkeeper.leftLeg.lower) {
+    Body.setPosition(goalkeeper.leftLeg.lower, {
+      x: resetX - 15,
+      y: resetY + 75
+    });
+    Body.setAngle(goalkeeper.leftLeg.lower, 0);
+  }
+
+  if (goalkeeper.rightLeg.upper) {
+    Body.setPosition(goalkeeper.rightLeg.upper, {
+      x: resetX + 15,
+      y: resetY + 35
+    });
+    Body.setAngle(goalkeeper.rightLeg.upper, 0);
+  }
+
+  if (goalkeeper.rightLeg.lower) {
+    Body.setPosition(goalkeeper.rightLeg.lower, {
+      x: resetX + 15,
+      y: resetY + 75
+    });
+    Body.setAngle(goalkeeper.rightLeg.lower, 0);
+  }
+
+  // Reset keeper state
+  goalkeeper.isSaving = false;
+  goalkeeper.reachTarget = null;
+  goalkeeper.reachingHand = null;
+
+  // Clear any dragging state
+  mouseInteraction.isDragging = false;
+  mouseInteraction.mouseHistory = [];
+
+  console.log('Goalkeeper gently reset to natural standing position.');
+}
+
+function checkStuckBalls() {
+  const currentTime = Date.now();
+
+  ballsData.forEach(ballInfo => {
+    if (ballInfo.isShooting && ballInfo.shotStartTime > 0) {
+      const shotDuration = currentTime - ballInfo.shotStartTime;
+
+      // Check if ball has been shooting for too long or is stuck
+      const body = ballInfo.matterBody;
+      const isVerySlowOrStopped = body && (
+        Math.abs(body.velocity.x) < 0.1 &&
+        Math.abs(body.velocity.y) < 0.1 &&
+        shotDuration > 1000 // Moving too slowly for more than 1 second
+      );
+
+      if (shotDuration > ballInfo.maxShotDuration || isVerySlowOrStopped) {
+        console.log(`Ball ${ballInfo.id} appears stuck! Duration: ${shotDuration}ms, velocity: (${body?.velocity.x.toFixed(2)}, ${body?.velocity.y.toFixed(2)})`);
+        forceResetBall(ballInfo);
+      }
+    }
+  });
+}
+
+function forceResetBall(ballInfo) {
+  const body = ballInfo.matterBody;
+  if (!body) return;
+
+  console.log(`Force resetting ball ${ballInfo.id}`);
+
+  // Reset physics state
+  Body.setStatic(body, true);
+  body.isSensor = true;
+  Body.setPosition(body, { x: ballInfo.initialX, y: ballInfo.initialY });
+  Body.setVelocity(body, { x: 0, y: 0 });
+  Body.setAngle(body, 0);
+  Body.setAngularVelocity(body, 0);
+
+  // Reset visual/game state
+  ballInfo.currentScale = 1;
+  ballInfo.isShooting = false;
+  ballInfo.shotStartTime = 0;
+
+  // Reset collision group
+  body.collisionFilter.group = 0;
+
+  // Get new problem for this ball
+  assignNewProblem(ballInfo);
+
+  // No more queue processing needed!
+}
+
+function applyStandingForces() {
+  if (!goalkeeper.torso) return;
+
+  // Stronger, more targeted forces
+  const TORSO_UPRIGHT_FORCE = 0.008; // Increased for better torso control
+  const LEG_SUPPORT_FORCE = 0.006; // Stronger leg support
+  const BALANCE_FORCE = 0.004; // Keep center of mass over feet
+  const RECOVERY_FORCE = 0.015; // Emergency recovery
+
+  const torso = goalkeeper.torso;
+  const platformY = CANVAS_HEIGHT * 0.6;
+
+  // 1. TORSO UPRIGHTNESS - Much stronger angular correction
+  const targetAngle = 0; // Perfectly upright
+  const angleError = torso.angle - targetAngle;
+
+  if (Math.abs(angleError) > 0.05) { // Tighter tolerance
+    // Apply angular impulse to correct rotation
+    Body.setAngularVelocity(torso, torso.angularVelocity - (angleError * TORSO_UPRIGHT_FORCE));
+  }
+
+  // 2. ACTIVE LEG SUPPORT - Push down on feet for support
+  const feet = [goalkeeper.leftLeg.lower, goalkeeper.rightLeg.lower];
+  feet.forEach(foot => {
+    if (foot) {
+      const footDistanceFromPlatform = platformY - foot.position.y;
+
+      if (footDistanceFromPlatform > 5) { // Foot is above platform
+        // Strong downward force to plant foot
+        Body.applyForce(foot, foot.position, { x: 0, y: LEG_SUPPORT_FORCE });
+
+        // Also reduce upward velocity if foot is moving up
+        if (foot.velocity.y < 0) {
+          Body.setVelocity(foot, { x: foot.velocity.x, y: foot.velocity.y * 0.8 });
+        }
+      }
+    }
+  });
+
+  // 3. BALANCE CONTROL - Keep torso over center of feet
+  const leftFoot = goalkeeper.leftLeg.lower;
+  const rightFoot = goalkeeper.rightLeg.lower;
+
+  if (leftFoot && rightFoot) {
+    const feetCenterX = (leftFoot.position.x + rightFoot.position.x) / 2;
+    const balanceError = torso.position.x - feetCenterX;
+
+    if (Math.abs(balanceError) > 20) { // If torso is off-center
+      // Apply corrective horizontal force
+      Body.applyForce(torso, torso.position, {
+        x: -balanceError * BALANCE_FORCE * 0.3,
+        y: 0
+      });
+
+      // Also adjust foot positions slightly
+      const footCorrection = balanceError * 0.0001;
+      Body.applyForce(leftFoot, leftFoot.position, { x: -footCorrection, y: 0 });
+      Body.applyForce(rightFoot, rightFoot.position, { x: -footCorrection, y: 0 });
+    }
+  }
+
+  // 4. EMERGENCY RECOVERY - If keeper is really messed up
+  const expectedTorsoY = CANVAS_HEIGHT * 0.4;
+  const torsoTooLow = torso.position.y > expectedTorsoY + 40;
+  const torsoTooFast = torso.velocity.y > 2; // Falling too fast
+
+  if (torsoTooLow || torsoTooFast) {
+    // Emergency upward boost
+    Body.applyForce(torso, torso.position, { x: 0, y: -RECOVERY_FORCE });
+
+    // Dampen excessive velocities
+    if (Math.abs(torso.velocity.x) > 3) {
+      Body.setVelocity(torso, { x: torso.velocity.x * 0.7, y: torso.velocity.y });
+    }
+  }
+
+  // 5. JOINT TENSION - Prevent joints from getting too loose
+  goalkeeper.constraints.forEach(constraint => {
+    if (constraint.length > constraint.restLength * 1.5) {
+      // Joint is overstretched - add tension
+      const tensionFactor = 0.9;
+      constraint.stiffness = Math.min(constraint.stiffness * 1.01, 0.95);
+    }
+  });
+}
+
+function preventKeeperSpinning() {
+  if (!goalkeeper.torso) return;
+
+  const MAX_ANGULAR_VELOCITY = 8; // Radians per second - anything higher gets damped
+  const ANGULAR_DAMPING = 0.85; // How much to reduce excessive spinning
+  const MAX_CONSTRAINT_STRETCH = 2.0; // Max stretch before correction
+  const POSITION_CORRECTION_STRENGTH = 0.02; // How strongly to pull parts back
+
+  // 1. ANGULAR VELOCITY LIMITING - Stop crazy spinning
+  goalkeeper.bodies.forEach(body => {
+    if (Math.abs(body.angularVelocity) > MAX_ANGULAR_VELOCITY) {
+      // Reduce spinning but don't completely stop it
+      Body.setAngularVelocity(body, body.angularVelocity * ANGULAR_DAMPING);
+
+      // Debug excessive spinning
+      if (Math.abs(body.angularVelocity) > MAX_ANGULAR_VELOCITY * 2) {
+        console.log(`Excessive spinning detected on ${body.label}: ${body.angularVelocity.toFixed(2)} rad/s`);
+      }
+    }
+  });
+
+  // 2. CONSTRAINT LENGTH MONITORING - Fix overstretched joints
+  goalkeeper.constraints.forEach(constraint => {
+    const currentLength = constraint.length;
+    const restLength = constraint.restLength || 10; // Default if not set
+    const stretchRatio = currentLength / restLength;
+
+    if (stretchRatio > MAX_CONSTRAINT_STRETCH) {
+      // Joint is way too stretched - apply corrective forces
+      const bodyA = constraint.bodyA;
+      const bodyB = constraint.bodyB;
+
+      if (bodyA && bodyB) {
+        // Calculate direction to pull bodies back together
+        const dx = bodyB.position.x - bodyA.position.x;
+        const dy = bodyB.position.y - bodyA.position.y;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+
+        if (distance > 0) {
+          const correctionForce = POSITION_CORRECTION_STRENGTH * (stretchRatio - 1);
+          const forceX = (dx / distance) * correctionForce;
+          const forceY = (dy / distance) * correctionForce;
+
+          // Pull them back together
+          Body.applyForce(bodyA, bodyA.position, { x: forceX, y: forceY });
+          Body.applyForce(bodyB, bodyB.position, { x: -forceX, y: -forceY });
+        }
+      }
+    }
+  });
+
+  // 3. HEAD STABILIZATION - Keep head reasonably positioned
+  if (goalkeeper.head && goalkeeper.torso) {
+    const head = goalkeeper.head;
+    const torso = goalkeeper.torso;
+
+    // Check if head is too far from torso
+    const headToTorsoDistance = Math.sqrt(
+      (head.position.x - torso.position.x) ** 2 +
+      (head.position.y - torso.position.y) ** 2
+    );
+
+    const maxHeadDistance = 60; // Max reasonable distance
+    if (headToTorsoDistance > maxHeadDistance) {
+      // Pull head back towards torso
+      const pullStrength = 0.005;
+      const dx = torso.position.x - head.position.x;
+      const dy = torso.position.y - head.position.y - 30; // Offset for neck
+
+      Body.applyForce(head, head.position, {
+        x: dx * pullStrength,
+        y: dy * pullStrength
+      });
+    }
+  }
+
+  // 4. LIMB ANGLE LIMITS - Prevent impossible rotations
+  const limbBodies = [
+    goalkeeper.leftArm.upper, goalkeeper.leftArm.lower,
+    goalkeeper.rightArm.upper, goalkeeper.rightArm.lower,
+    goalkeeper.leftLeg.upper, goalkeeper.leftLeg.lower,
+    goalkeeper.rightLeg.upper, goalkeeper.rightLeg.lower
+  ];
+
+  limbBodies.forEach(limb => {
+    if (limb) {
+      // If limb is rotating too fast, dampen it
+      if (Math.abs(limb.angularVelocity) > MAX_ANGULAR_VELOCITY * 0.7) {
+        Body.setAngularVelocity(limb, limb.angularVelocity * 0.9);
+      }
+
+      // Prevent extreme angles (more than 6 full rotations)
+      const extremeAngle = Math.PI * 12; // 6 full rotations
+      if (Math.abs(limb.angle) > extremeAngle) {
+        // Reset angle to a more reasonable value
+        const normalizedAngle = limb.angle % (Math.PI * 2);
+        Body.setAngle(limb, normalizedAngle);
+        Body.setAngularVelocity(limb, limb.angularVelocity * 0.5);
+      }
+    }
+  });
+}
+
+// 🎬 SAVE ANIMATION SYSTEM
+function determineSaveAnimation(targetX, targetY) {
+  if (!goalkeeper.torso) return;
+
+  const torso = goalkeeper.torso;
+  const platformY = CANVAS_HEIGHT * 0.6;
+
+  // Calculate distance to target
+  const distanceToTarget = Math.sqrt(
+    (targetX - torso.position.x) ** 2 +
+    (targetY - torso.position.y) ** 2
+  );
+
+  // Check if keeper is on ground (within 50px of platform)
+  const feet = [goalkeeper.leftLeg.lower, goalkeeper.rightLeg.lower];
+  const isOnGround = feet.some(foot =>
+    foot && Math.abs(foot.position.y - platformY) < 50
+  );
+
+  // Check if target is high (in air)
+  const isHighTarget = targetY < CANVAS_HEIGHT * 0.45;
+
+  // Determine animation type based on context
+  let animationType = 'ragdoll'; // Default
+
+  if (distanceToTarget < 80) {
+    // Close save - just reach out
+    animationType = 'reaching';
+  } else if (isOnGround && isHighTarget) {
+    // Ground + high target = jumping save
+    animationType = 'jumping';
+  } else if (!isOnGround) {
+    // Already in air = superman dive
+    animationType = 'superman';
+  } else if (distanceToTarget > 120) {
+    // Far distance = diving save
+    animationType = 'superman';
+  }
+
+  console.log(`Save animation: ${animationType} (distance: ${distanceToTarget.toFixed(0)}, onGround: ${isOnGround}, highTarget: ${isHighTarget})`);
+
+  // Apply the animation
+  applySaveAnimation(animationType);
+}
+
+function applySaveAnimation(animationType) {
+  goalkeeper.animationState = animationType;
+  goalkeeper.animationStartTime = Date.now();
+
+  // Store current positions for restoration later
+  goalkeeper.savedPositions = {};
+  goalkeeper.bodies.forEach(body => {
+    goalkeeper.savedPositions[body.label] = {
+      x: body.position.x,
+      y: body.position.y,
+      angle: body.angle
+    };
+  });
+
+  // Apply the specific pose
+  switch (animationType) {
+    case 'jumping':
+      applyJumpingPose();
+      break;
+    case 'reaching':
+      applyReachingPose();
+      break;
+    case 'superman':
+      applySupermanPose();
+      break;
+    default:
+      // Stay in ragdoll mode
+      break;
+  }
+}
+
+function applyJumpingPose() {
+  if (!goalkeeper.torso) return;
+
+  const torso = goalkeeper.torso;
+  const targetX = goalkeeper.reachTarget.x;
+
+  // Bend legs for jumping motion
+  if (goalkeeper.leftLeg.upper && goalkeeper.leftLeg.lower) {
+    Body.setAngle(goalkeeper.leftLeg.upper, -0.3); // Bend knee
+    Body.setAngle(goalkeeper.leftLeg.lower, 0.6);  // Bend shin
+  }
+
+  if (goalkeeper.rightLeg.upper && goalkeeper.rightLeg.lower) {
+    Body.setAngle(goalkeeper.rightLeg.upper, -0.3);
+    Body.setAngle(goalkeeper.rightLeg.lower, 0.6);
+  }
+
+  // Extend reaching arm toward target
+  const isLeftSide = targetX < torso.position.x;
+  if (isLeftSide && goalkeeper.leftArm.upper && goalkeeper.leftArm.lower) {
+    Body.setAngle(goalkeeper.leftArm.upper, -1.2); // Reach up
+    Body.setAngle(goalkeeper.leftArm.lower, -0.5);
+  } else if (!isLeftSide && goalkeeper.rightArm.upper && goalkeeper.rightArm.lower) {
+    Body.setAngle(goalkeeper.rightArm.upper, 1.2);
+    Body.setAngle(goalkeeper.rightArm.lower, 0.5);
+  }
+
+  // Add upward jump force
+  Body.applyForce(torso, torso.position, { x: 0, y: -0.015 });
+}
+
+function applyReachingPose() {
+  if (!goalkeeper.torso) return;
+
+  const torso = goalkeeper.torso;
+  const targetX = goalkeeper.reachTarget.x;
+
+  // Just extend arms toward target - simple reach
+  const isLeftSide = targetX < torso.position.x;
+
+  if (isLeftSide && goalkeeper.leftArm.upper && goalkeeper.leftArm.lower) {
+    Body.setAngle(goalkeeper.leftArm.upper, -0.8); // Extend left
+    Body.setAngle(goalkeeper.leftArm.lower, 0);
+  } else if (!isLeftSide && goalkeeper.rightArm.upper && goalkeeper.rightArm.lower) {
+    Body.setAngle(goalkeeper.rightArm.upper, 0.8);  // Extend right
+    Body.setAngle(goalkeeper.rightArm.lower, 0);
+  }
+}
+
+function applySupermanPose() {
+  if (!goalkeeper.torso) return;
+
+  const torso = goalkeeper.torso;
+  const targetX = goalkeeper.reachTarget.x;
+
+  // Superman flying pose - one arm extended, other by side
+  const isLeftSide = targetX < torso.position.x;
+
+  if (isLeftSide) {
+    // Reaching with left arm
+    if (goalkeeper.leftArm.upper && goalkeeper.leftArm.lower) {
+      Body.setAngle(goalkeeper.leftArm.upper, -1.5); // Full extension
+      Body.setAngle(goalkeeper.leftArm.lower, 0);
+    }
+    // Right arm by side
+    if (goalkeeper.rightArm.upper && goalkeeper.rightArm.lower) {
+      Body.setAngle(goalkeeper.rightArm.upper, 0.3);
+      Body.setAngle(goalkeeper.rightArm.lower, 0);
+    }
+  } else {
+    // Reaching with right arm
+    if (goalkeeper.rightArm.upper && goalkeeper.rightArm.lower) {
+      Body.setAngle(goalkeeper.rightArm.upper, 1.5);
+      Body.setAngle(goalkeeper.rightArm.lower, 0);
+    }
+    // Left arm by side
+    if (goalkeeper.leftArm.upper && goalkeeper.leftArm.lower) {
+      Body.setAngle(goalkeeper.leftArm.upper, -0.3);
+      Body.setAngle(goalkeeper.leftArm.lower, 0);
+    }
+  }
+
+  // Extend legs backward for diving pose
+  if (goalkeeper.leftLeg.upper && goalkeeper.leftLeg.lower) {
+    Body.setAngle(goalkeeper.leftLeg.upper, 0.4);
+    Body.setAngle(goalkeeper.leftLeg.lower, -0.2);
+  }
+
+  if (goalkeeper.rightLeg.upper && goalkeeper.rightLeg.lower) {
+    Body.setAngle(goalkeeper.rightLeg.upper, 0.4);
+    Body.setAngle(goalkeeper.rightLeg.lower, -0.2);
+  }
+}
+
+function updateAnimationState() {
+  if (!goalkeeper.torso) return;
+
+  // Check if we're in an animation state and if it should expire
+  if (goalkeeper.animationState !== 'ragdoll') {
+    const elapsed = Date.now() - goalkeeper.animationStartTime;
+
+    if (elapsed > goalkeeper.animationDuration) {
+      // Animation time expired - return to ragdoll
+      console.log(`Animation ${goalkeeper.animationState} completed, returning to ragdoll`);
+      goalkeeper.animationState = 'ragdoll';
+      goalkeeper.animationStartTime = 0;
+
+      // Optional: Apply small forces to make transition smoother
+      // (The standing forces will naturally help the keeper recover)
+    }
+  }
+}
+
+// Mobile detection
+function isMobile() {
+  return window.innerWidth <= 480;
+}
+
+// Initialize ballsData based on device type
+function initializeBallsData() {
+  const ballSpacing = CANVAS_WIDTH * 0.15; // 15% of canvas width for spacing
+  const ballY = CANVAS_HEIGHT - 60; // 60px from bottom
+
+  if (isMobile()) {
+    // Mobile: only one ball
+    return [
+      { id: 'ball1', problemText: "", initialX: CANVAS_WIDTH / 2, initialY: ballY, solutionText: "", matterBody: null, isShooting: false, shootTargetX: 0, shootTargetY: 0, currentScale: 1, shotStartTime: 0, maxShotDuration: 3000 }
+    ];
+  } else {
+    // Desktop: three balls with proportional spacing
+    return [
+      { id: 'ball1', problemText: "", initialX: CANVAS_WIDTH / 2 - ballSpacing, initialY: ballY, solutionText: "", matterBody: null, isShooting: false, shootTargetX: 0, shootTargetY: 0, currentScale: 1, shotStartTime: 0, maxShotDuration: 3000 },
+      { id: 'ball2', problemText: "", initialX: CANVAS_WIDTH / 2, initialY: ballY, solutionText: "", matterBody: null, isShooting: false, shootTargetX: 0, shootTargetY: 0, currentScale: 1, shotStartTime: 0, maxShotDuration: 3000 },
+      { id: 'ball3', problemText: "", initialX: CANVAS_WIDTH / 2 + ballSpacing, initialY: ballY, solutionText: "", matterBody: null, isShooting: false, shootTargetX: 0, shootTargetY: 0, currentScale: 1, shotStartTime: 0, maxShotDuration: 3000 }
+    ];
+  }
+}
+
+let ballsData = initializeBallsData();
 
 const problemSolutionList = [
   { problem: "Slow Load Times", solution: "Optimize images and use lazy loading!" },
@@ -95,11 +785,409 @@ goalImage.onerror = () => {
   // You might want to draw a fallback rectangle if the image fails
 };
 
+// Goalkeeper customization images
+const keeperImages = {
+  head: null,
+  jersey: null,
+  gloves: null
+};
+
+let keeperImagesLoaded = {
+  head: false,
+  jersey: false,
+  gloves: false
+};
+
+// Function to load goalkeeper images (can be called to customize)
+function loadKeeperImage(bodyPart, imageSrc) {
+  if (!['head', 'jersey', 'gloves'].includes(bodyPart)) {
+    console.error(`Invalid body part: ${bodyPart}`);
+    return;
+  }
+
+  const img = new Image();
+  img.onload = () => {
+    keeperImages[bodyPart] = img;
+    keeperImagesLoaded[bodyPart] = true;
+    console.log(`Keeper ${bodyPart} image loaded successfully.`);
+  };
+  img.onerror = () => {
+    console.error(`Error loading keeper ${bodyPart} image: ${imageSrc}`);
+    keeperImagesLoaded[bodyPart] = false;
+  };
+  img.src = imageSrc;
+}
+
+// Public interface for easy goalkeeper customization
+window.customizeGoalkeeper = {
+  setHead: (imageSrc) => loadKeeperImage('head', imageSrc),
+  setJersey: (imageSrc) => loadKeeperImage('jersey', imageSrc),
+  setGloves: (imageSrc) => loadKeeperImage('gloves', imageSrc)
+};
+
+// Example usage:
+customizeGoalkeeper.setHead('keeper-head.png');
+// customizeGoalkeeper.setJersey('path/to/jersey.png');
+// customizeGoalkeeper.setGloves('path/to/gloves.png');
+
+// Debug function to test particle system manually
+window.testParticles = function () {
+  const centerX = CANVAS_WIDTH / 2;
+  const centerY = CANVAS_HEIGHT / 2;
+  createAerialAdjustmentEffect(centerX, centerY);
+  console.log('Manual particle test triggered! Particle count:', particles.length);
+};
+
+// Debug functions for tuning
+window.adjustMouseSensitivity = function (strength) {
+  mouseInteraction.followStrength = strength;
+  console.log(`Mouse follow strength set to: ${strength}`);
+};
+
+window.showKeeperStats = function () {
+  if (!goalkeeper.torso) return;
+
+  const torso = goalkeeper.torso;
+  console.log('--- KEEPER STATS ---');
+  console.log(`Position: (${torso.position.x.toFixed(1)}, ${torso.position.y.toFixed(1)})`);
+  console.log(`Velocity: (${torso.velocity.x.toFixed(2)}, ${torso.velocity.y.toFixed(2)})`);
+  console.log(`Angle: ${(torso.angle * 180 / Math.PI).toFixed(1)}°`);
+  console.log(`Angular velocity: ${torso.angularVelocity.toFixed(2)} rad/s`);
+  console.log(`Dragging: ${mouseInteraction.isDragging}`);
+
+  // Check foot positions
+  const leftFoot = goalkeeper.leftLeg.lower;
+  const rightFoot = goalkeeper.rightLeg.lower;
+  if (leftFoot && rightFoot) {
+    const platformY = CANVAS_HEIGHT * 0.6;
+    console.log(`Left foot distance from platform: ${(platformY - leftFoot.position.y).toFixed(1)}`);
+    console.log(`Right foot distance from platform: ${(platformY - rightFoot.position.y).toFixed(1)}`);
+  }
+};
+
+// Emergency functions for when keeper gets too crazy
+window.calmKeeperDown = function () {
+  if (!goalkeeper.torso) return;
+
+  console.log('Calming keeper down - reducing all velocities and spins');
+
+  goalkeeper.bodies.forEach(body => {
+    // Reduce all velocities by 50%
+    Body.setVelocity(body, {
+      x: body.velocity.x * 0.5,
+      y: body.velocity.y * 0.5
+    });
+
+    // Reduce angular velocity by 70%
+    Body.setAngularVelocity(body, body.angularVelocity * 0.3);
+  });
+};
+
+window.resetKeeperCompletely = function () {
+  console.log('EMERGENCY KEEPER RESET!');
+  resetGoalkeeper(); // Use existing reset function
+};
+
+// Animation testing functions
+window.testJumping = function () {
+  applySaveAnimation('jumping');
+  console.log('Testing jumping animation');
+};
+
+window.testReaching = function () {
+  applySaveAnimation('reaching');
+  console.log('Testing reaching animation');
+};
+
+window.testSuperman = function () {
+  applySaveAnimation('superman');
+  console.log('Testing superman animation');
+};
+
+window.testAllAnimations = function () {
+  console.log('Testing all animations with delays...');
+  applySaveAnimation('reaching');
+  setTimeout(() => applySaveAnimation('jumping'), 2000);
+  setTimeout(() => applySaveAnimation('superman'), 4000);
+  setTimeout(() => goalkeeper.animationState = 'ragdoll', 6000);
+};
+
+// Debug timing function
+window.showSaveTimingInfo = function () {
+  const activeBalls = ballsData.filter(ball => ball.isShooting);
+  const goalLineY = CANVAS_HEIGHT * 0.27;
+
+  console.log('--- SAVE TIMING DEBUG ---');
+  console.log(`Goal line Y: ${goalLineY.toFixed(1)}`);
+  console.log(`Canvas size: ${CANVAS_WIDTH}x${CANVAS_HEIGHT}`);
+
+  activeBalls.forEach(ball => {
+    const pos = ball.matterBody.position;
+    const distanceToGoal = pos.y - goalLineY;
+    console.log(`${ball.id}: Y=${pos.y.toFixed(1)}, distance to goal line: ${distanceToGoal.toFixed(1)}px`);
+  });
+
+  if (goalkeeper.reachTarget) {
+    console.log(`Keeper reaching for: (${goalkeeper.reachTarget.x.toFixed(1)}, ${goalkeeper.reachTarget.y.toFixed(1)})`);
+    console.log(`Animation state: ${goalkeeper.animationState}`);
+  }
+};
+
+// Debug ball states
+window.showBallStates = function () {
+  console.log('--- BALL STATES ---');
+  ballsData.forEach(ball => {
+    const body = ball.matterBody;
+    if (body) {
+      console.log(`${ball.id}: isShooting=${ball.isShooting}, pos=(${body.position.x.toFixed(1)}, ${body.position.y.toFixed(1)}), isStatic=${body.isStatic}, isSensor=${body.isSensor}`);
+    } else {
+      console.log(`${ball.id}: NO MATTER BODY!`);
+    }
+  });
+  console.log(`Total balls in ballsData: ${ballsData.length}`);
+};
+
+// Mouse interaction functions for draggable keeper
+function getMousePos(canvas, evt) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+
+  return {
+    x: (evt.clientX - rect.left) * scaleX,
+    y: (evt.clientY - rect.top) * scaleY
+  };
+}
+
+function isMouseNearKeeper(mouseX, mouseY) {
+  if (!goalkeeper.torso) return false;
+
+  const keeperX = goalkeeper.torso.position.x;
+  const keeperY = goalkeeper.torso.position.y;
+  const distance = Math.sqrt((mouseX - keeperX) ** 2 + (mouseY - keeperY) ** 2);
+
+  return distance < 80; // Within 80 pixels of keeper's torso
+}
+
+function handleMouseDown(evt) {
+  const mousePos = getMousePos(canvas, evt);
+
+  if (isMouseNearKeeper(mousePos.x, mousePos.y)) {
+    mouseInteraction.isDragging = true;
+    mouseInteraction.lastMouseX = mousePos.x;
+    mouseInteraction.lastMouseY = mousePos.y;
+    canvas.style.cursor = 'grabbing';
+    console.log('Started dragging keeper!');
+  }
+}
+
+function handleMouseMove(evt) {
+  const mousePos = getMousePos(canvas, evt);
+
+  // Update cursor when hovering over keeper
+  if (!mouseInteraction.isDragging) {
+    if (isMouseNearKeeper(mousePos.x, mousePos.y)) {
+      canvas.style.cursor = 'grab';
+    } else {
+      canvas.style.cursor = 'default';
+    }
+  }
+
+  // Handle dragging with smooth following
+  if (mouseInteraction.isDragging && goalkeeper.torso) {
+    // Add to mouse history for throw velocity calculation
+    mouseInteraction.mouseHistory.push({
+      x: mousePos.x,
+      y: mousePos.y,
+      time: Date.now()
+    });
+
+    // Keep history size manageable
+    if (mouseInteraction.mouseHistory.length > mouseInteraction.maxHistoryLength) {
+      mouseInteraction.mouseHistory.shift();
+    }
+
+    // Smooth follow: pull torso towards mouse position
+    const torso = goalkeeper.torso;
+    const targetX = mousePos.x;
+    const targetY = mousePos.y;
+
+    // Calculate gentle pull force towards mouse
+    const pullX = (targetX - torso.position.x) * mouseInteraction.followStrength;
+    const pullY = (targetY - torso.position.y) * mouseInteraction.followStrength;
+
+    Body.applyForce(torso, torso.position, { x: pullX, y: pullY });
+
+    mouseInteraction.lastMouseX = mousePos.x;
+    mouseInteraction.lastMouseY = mousePos.y;
+  }
+}
+
+function handleMouseUp(evt) {
+  if (mouseInteraction.isDragging) {
+    // Calculate throw velocity from recent mouse movement
+    calculateAndApplyThrowVelocity();
+
+    mouseInteraction.isDragging = false;
+    mouseInteraction.mouseHistory = []; // Clear history
+    canvas.style.cursor = 'default';
+    console.log('Stopped dragging keeper - applied throw velocity!');
+  }
+}
+
+function calculateAndApplyThrowVelocity() {
+  if (mouseInteraction.mouseHistory.length < 2 || !goalkeeper.torso) return;
+
+  // Get the most recent mouse movements
+  const recent = mouseInteraction.mouseHistory.slice(-3); // Last 3 positions
+  const oldest = recent[0];
+  const newest = recent[recent.length - 1];
+
+  const timeDiff = newest.time - oldest.time;
+  if (timeDiff === 0) return; // Avoid division by zero
+
+  // Calculate velocity (pixels per millisecond, then convert to appropriate scale)
+  const velocityX = (newest.x - oldest.x) / timeDiff;
+  const velocityY = (newest.y - oldest.y) / timeDiff;
+
+  // Scale and limit the throw force - more conservative to prevent spinning
+  const throwStrength = 0.03; // Reduced from 0.05 to prevent excessive momentum
+  const maxThrow = 0.15; // Reduced max throw velocity to prevent spinning
+
+  let throwX = velocityX * throwStrength;
+  let throwY = velocityY * throwStrength;
+
+  // Limit throw velocity
+  const throwMagnitude = Math.sqrt(throwX * throwX + throwY * throwY);
+  if (throwMagnitude > maxThrow) {
+    const scale = maxThrow / throwMagnitude;
+    throwX *= scale;
+    throwY *= scale;
+  }
+
+  // Additional safety: don't throw if mouse was barely moving
+  if (throwMagnitude < 0.01) {
+    throwX = 0;
+    throwY = 0;
+  }
+
+  // Apply the throw velocity to the torso
+  Body.setVelocity(goalkeeper.torso, {
+    x: goalkeeper.torso.velocity.x + throwX,
+    y: goalkeeper.torso.velocity.y + throwY
+  });
+
+  console.log(`Throw applied: vx=${throwX.toFixed(3)}, vy=${throwY.toFixed(3)}`);
+}
+
+function drawKeeperCustomizations() {
+  // Draw custom head image with preserved aspect ratio
+  if (keeperImagesLoaded.head && keeperImages.head && goalkeeper.head) {
+    const head = goalkeeper.head;
+    const maxSize = KEEPER_HEAD_RADIUS * 2.4; // Max size constraint
+
+    // Calculate scaled dimensions preserving aspect ratio
+    const imgAspect = keeperImages.head.width / keeperImages.head.height;
+    let drawWidth, drawHeight;
+
+    if (imgAspect > 1) {
+      // Wide image - constrain by width
+      drawWidth = maxSize;
+      drawHeight = maxSize / imgAspect;
+    } else {
+      // Tall image - constrain by height
+      drawHeight = maxSize;
+      drawWidth = maxSize * imgAspect;
+    }
+
+    ctx.save();
+    ctx.translate(head.position.x, head.position.y);
+    ctx.rotate(head.angle);
+    ctx.drawImage(
+      keeperImages.head,
+      -drawWidth / 2, -drawHeight / 2,
+      drawWidth, drawHeight
+    );
+    ctx.restore();
+  }
+
+  // Draw custom jersey image on torso
+  if (keeperImagesLoaded.jersey && keeperImages.jersey && goalkeeper.torso) {
+    const torso = goalkeeper.torso;
+    const imgWidth = KEEPER_TORSO_WIDTH * 1.5; // Slightly larger than torso
+    const imgHeight = KEEPER_TORSO_HEIGHT * 1.2;
+
+    ctx.save();
+    ctx.translate(torso.position.x, torso.position.y);
+    ctx.rotate(torso.angle);
+    ctx.drawImage(
+      keeperImages.jersey,
+      -imgWidth / 2, -imgHeight / 2,
+      imgWidth, imgHeight
+    );
+    ctx.restore();
+  }
+
+  // Draw custom gloves on hands (lower arms)
+  if (keeperImagesLoaded.gloves && keeperImages.gloves) {
+    [goalkeeper.leftArm.lower, goalkeeper.rightArm.lower].forEach(hand => {
+      if (hand) {
+        const imgSize = KEEPER_LIMB_WIDTH * 2.5; // Make gloves larger than the hand
+
+        ctx.save();
+        ctx.translate(hand.position.x, hand.position.y);
+        ctx.rotate(hand.angle);
+        ctx.drawImage(
+          keeperImages.gloves,
+          -imgSize / 2, -imgSize / 2,
+          imgSize, imgSize
+        );
+        ctx.restore();
+      }
+    });
+  }
+}
+
 // Function to set canvas size
 function resizeCanvas() {
+  const dimensions = getCanvasDimensions();
+  CANVAS_WIDTH = dimensions.width;
+  CANVAS_HEIGHT = dimensions.height;
+
   canvas.width = CANVAS_WIDTH;
   canvas.height = CANVAS_HEIGHT;
+
+  console.log(`Canvas resized to: ${CANVAS_WIDTH}x${CANVAS_HEIGHT}`);
   // No Matter.Render to update, our custom draw will use these dimensions
+}
+
+// Handle window resize for mobile responsiveness
+function handleResize() {
+  const wasMobile = ballsData.length === 1;
+  const nowMobile = isMobile();
+
+  // If device type changed (mobile to desktop or vice versa)
+  if (wasMobile !== nowMobile) {
+    console.log(`Device type changed. Mobile: ${nowMobile}`);
+
+    // Reinitialize balls data
+    ballsData = initializeBallsData();
+
+    // Remove old physics bodies
+    if (engine && engine.world) {
+      const oldBalls = Composite.allBodies(engine.world).filter(body => body.label && body.label.startsWith('ball-'));
+      Composite.remove(engine.world, oldBalls);
+    }
+
+    // Recreate physics balls
+    createPhysicalBalls();
+
+    // Update HTML controls
+    setupBallControls();
+
+    // Reassign problems to new balls
+    ballsData.forEach(ball => assignNewProblem(ball));
+  }
 }
 
 // Function to initialize Matter.js
@@ -115,12 +1203,13 @@ function initPhysics() {
   // Composite.remove(engine.world, ground); // If 'ground' was added before
   // ground = null; // Or re-purpose ground if needed for edges of screen
 
-  // Create Invisible Keeper Platform
+  // Create Invisible Keeper Platform - MUCH LARGER to prevent keeper from falling off
   // Position it within the goal, slightly below the visual goal line for perspective.
   // Adjust Y and height based on your goal image and desired perspective.
   const platformY = CANVAS_HEIGHT * 0.6; // Example: 70% down the canvas
-  const platformHeight = 20;
-  keeperPlatform = Bodies.rectangle(CANVAS_WIDTH / 2, platformY, CANVAS_WIDTH, platformHeight, {
+  const platformHeight = 40; // Increased height
+  const platformWidth = CANVAS_WIDTH * 3; // Much wider than canvas to catch keeper
+  keeperPlatform = Bodies.rectangle(CANVAS_WIDTH / 2, platformY, platformWidth, platformHeight, {
     isStatic: true,
     label: 'keeperPlatform',
     render: { visible: false }, // INVISIBLE
@@ -183,6 +1272,22 @@ function setupBallControls() {
 
     controlDiv.appendChild(problemTextP);
     controlDiv.appendChild(shootButton);
+
+    // Add "Next Problem" button for mobile devices
+    if (isMobile()) {
+      const nextProblemButton = document.createElement('button');
+      nextProblemButton.classList.add('shoot-button');
+      nextProblemButton.textContent = 'Next Problem';
+      nextProblemButton.style.backgroundColor = '#2196F3'; // Blue color to differentiate
+      nextProblemButton.style.marginTop = '5px';
+
+      nextProblemButton.addEventListener('click', () => {
+        assignNewProblem(ball);
+      });
+
+      controlDiv.appendChild(nextProblemButton);
+    }
+
     ballControlsContainer.appendChild(controlDiv);
   });
 }
@@ -190,25 +1295,74 @@ function setupBallControls() {
 function handleShoot(ballId) {
   const ballInfo = ballsData.find(b => b.id === ballId);
   if (ballInfo && !ballInfo.isShooting) { // Prevent shooting if already in motion
-    console.log(`Shooting ${ballId}`);
+    console.log(`Firing ${ballId} immediately!`);
+
+    // Generate target using probability map that favors corners
+    const target = generateShotTarget();
+
+    // Fire immediately - no more queuing!
     ballInfo.isShooting = true;
-    ballInfo.currentScale = 1; // Reset scale
+    ballInfo.currentScale = 1;
+    ballInfo.shootTargetX = target.x;
+    ballInfo.shootTargetY = target.y;
+    ballInfo.shotStartTime = Date.now();
 
-    // Define a target for the shot (e.g., center of goal area)
-    // For now, a fixed point. Later, random within goal with probability map.
-    // Goal area visual center (approximate, adjust based on your goal image)
-    const goalVisualCenterY = CANVAS_HEIGHT * 0.35; // Example Y
-    const goalVisualWidth = 200; // Example visual width of goal mouth
-    ballInfo.shootTargetX = CANVAS_WIDTH / 2 + (Math.random() - 0.5) * goalVisualWidth * 0.8;
-    ballInfo.shootTargetY = goalVisualCenterY;
-
-    // TRIGGER THE KEEPER'S REACTION
-    keeperAttemptSave(ballInfo.shootTargetX, ballInfo.shootTargetY);
-
-
-    // The actual animation will happen in gameLoop
+    // Trigger keeper reaction immediately
+    keeperAttemptSave(target.x, target.y);
   }
 }
+
+function generateShotTarget() {
+  // Define goal area boundaries - based on actual goal image size
+  const goalCenterX = CANVAS_WIDTH / 2;
+  const goalCenterY = CANVAS_HEIGHT * 0.28; // Adjusted to match goal image position
+
+  // Use more conservative goal size for better corner targeting
+  const goalWidth = Math.min(CANVAS_WIDTH * 0.3, 350); // Max 350px or 30% of width
+  const goalHeight = Math.min(CANVAS_HEIGHT * 0.15, 120); // Max 120px or 15% of height
+
+  const goalLeft = goalCenterX - goalWidth / 2;
+  const goalRight = goalCenterX + goalWidth / 2;
+  const goalTop = goalCenterY - goalHeight / 2;
+  const goalBottom = goalCenterY + goalHeight / 2;
+
+  // Define corner zones (25% chance each corner, 25% chance center area)
+  const cornerInfluence = 0.7; // How much to bias toward corners (0-1)
+  const random = Math.random();
+
+  let targetX, targetY;
+
+  if (random < 0.25) {
+    // Top-left corner
+    targetX = goalLeft + (goalWidth * 0.15) * Math.random();
+    targetY = goalTop + (goalHeight * 0.3) * Math.random();
+  } else if (random < 0.5) {
+    // Top-right corner
+    targetX = goalRight - (goalWidth * 0.15) * Math.random();
+    targetY = goalTop + (goalHeight * 0.3) * Math.random();
+  } else if (random < 0.75) {
+    // Bottom-left corner
+    targetX = goalLeft + (goalWidth * 0.15) * Math.random();
+    targetY = goalBottom - (goalHeight * 0.3) * Math.random();
+  } else {
+    // Bottom-right corner
+    targetX = goalRight - (goalWidth * 0.15) * Math.random();
+    targetY = goalBottom - (goalHeight * 0.3) * Math.random();
+  }
+
+  // Add some randomness to make it less predictable
+  const randomness = 15; // pixels of random variation
+  targetX += (Math.random() - 0.5) * randomness;
+  targetY += (Math.random() - 0.5) * randomness;
+
+  // Ensure target stays within goal bounds
+  targetX = Math.max(goalLeft, Math.min(goalRight, targetX));
+  targetY = Math.max(goalTop, Math.min(goalBottom, targetY));
+
+  return { x: targetX, y: targetY };
+}
+
+// processNextShot function removed - no more queuing!
 
 function createGoalkeeper() {
   // Adjusted initial Y to be higher, assuming platform will be in goal
@@ -339,55 +1493,133 @@ function createGoalkeeper() {
   Composite.add(engine.world, goalkeeper.constraints);
 }
 
+function showSpeechBubble(text) {
+  speechBubble.text = text;
+  speechBubble.isVisible = true;
+  speechBubble.targetOpacity = 1;
+  speechBubble.showStartTime = Date.now();
+  console.log(`Showing speech bubble: "${text}"`);
+}
+
+function hideSpeechBubble() {
+  speechBubble.targetOpacity = 0;
+  // Note: isVisible will be set to false when opacity reaches 0 in the update loop
+}
+
+function assignNewProblem(ballInfo) {
+  // Get a new random problem from the list
+  const newProblemData = problemSolutionList[problemCycleIndex % problemSolutionList.length];
+  ballInfo.problemText = newProblemData.problem;
+  ballInfo.solutionText = newProblemData.solution;
+  problemCycleIndex++;
+
+  // Update the corresponding HTML control
+  updateBallControl(ballInfo);
+
+  console.log(`Assigned new problem to ${ballInfo.id}: "${ballInfo.problemText}"`);
+}
+
+function updateBallControl(ballInfo) {
+  const controlDiv = document.getElementById(`control-${ballInfo.id}`);
+  if (controlDiv) {
+    const problemTextElement = controlDiv.querySelector('.problem-text');
+    if (problemTextElement) {
+      problemTextElement.textContent = ballInfo.problemText;
+    }
+  }
+}
+
 function keeperAttemptSave(targetX, targetY) {
   if (!goalkeeper.torso) return; // Can't do anything if there's no keeper
 
-  // Set keeper state
-  goalkeeper.isSaving = true;
-  goalkeeper.reachTarget = { x: targetX, y: targetY };
+  // For multiple simultaneous balls, calculate the "center of action"
+  const activeBalls = ballsData.filter(ball => ball.isShooting);
 
-  // Decide which hand to use based on target's X position
-  if (targetX < goalkeeper.torso.position.x) {
+  let centerX = targetX;
+  let centerY = targetY;
+  let ballToSave = activeBalls.find(ball =>
+    ball.shootTargetX === targetX && ball.shootTargetY === targetY
+  ) || activeBalls[0]; // Find the specific ball or use first active ball
+
+  if (activeBalls.length > 1) {
+    // Calculate center of mass of all active targets
+    centerX = activeBalls.reduce((sum, ball) => sum + ball.shootTargetX, 0) / activeBalls.length;
+    centerY = activeBalls.reduce((sum, ball) => sum + ball.shootTargetY, 0) / activeBalls.length;
+    console.log(`Multiple balls detected! Keeper aiming for center: (${centerX.toFixed(1)}, ${centerY.toFixed(1)})`);
+  }
+
+  // Set keeper state - always update to latest/center target
+  goalkeeper.isSaving = true;
+  goalkeeper.reachTarget = { x: centerX, y: centerY };
+
+  // Decide which hand to use based on center target's X position
+  if (centerX < goalkeeper.torso.position.x) {
     goalkeeper.reachingHand = goalkeeper.leftArm.lower; // Reach with left hand
   } else {
     goalkeeper.reachingHand = goalkeeper.rightArm.lower; // Reach with right hand
   }
 
-  // 1. Get current position of the keeper's torso
-  const keeperPosition = goalkeeper.torso.position;
+  // 🎬 DETERMINE SAVE ANIMATION TYPE
+  determineSaveAnimation(centerX, centerY);
 
-  // 2. Calculate the vector from the keeper to the target
+  // 🎯 CALCULATE REALISTIC KEEPER TIMING
+  calculateKeeperTiming(centerX, centerY, ballToSave);
+}
+
+function calculateKeeperTiming(targetX, targetY, ballToSave) {
+  if (!goalkeeper.torso || !ballToSave || !ballToSave.matterBody) return;
+
+  const keeperPosition = goalkeeper.torso.position;
+  const ballPosition = ballToSave.matterBody.position;
+
+  // 1. Calculate how long ball will take to reach target
+  const ballToTargetDistance = Math.sqrt(
+    (targetX - ballPosition.x) ** 2 +
+    (targetY - ballPosition.y) ** 2
+  );
+  const ballSpeed = 5; // pixels per frame (same as animation speed)
+  const ballTimeToTarget = ballToTargetDistance / ballSpeed; // frames until ball arrives
+
+  // 2. Calculate keeper distance to target
+  const keeperToTargetDistance = Math.sqrt(
+    (targetX - keeperPosition.x) ** 2 +
+    (targetY - keeperPosition.y) ** 2
+  );
+
+  // 3. Calculate required keeper speed to arrive at same time
+  const requiredKeeperSpeed = keeperToTargetDistance / ballTimeToTarget;
+
+  // 4. Convert to force (physics calculation)
+  // Scale force based on distance and time - more realistic
+  const baseForce = 0.01; // Base force multiplier
+  const urgencyMultiplier = Math.min(ballTimeToTarget / 30, 2); // More urgent if ball arrives soon
+  const distanceMultiplier = Math.min(keeperToTargetDistance / 100, 3); // More force for farther saves
+
+  const forceStrength = baseForce * urgencyMultiplier * distanceMultiplier;
+
+  // 5. Apply force in direction of target
   const vectorToTarget = {
     x: targetX - keeperPosition.x,
     y: targetY - keeperPosition.y
   };
 
-  // 3. Calculate the distance to normalize the vector
-  const distance = Math.sqrt(vectorToTarget.x * vectorToTarget.x + vectorToTarget.y * vectorToTarget.y);
-  if (distance === 0) return; // Avoid division by zero
+  const distance = Math.sqrt(vectorToTarget.x ** 2 + vectorToTarget.y ** 2);
+  if (distance === 0) return;
 
   const normalizedVector = {
     x: vectorToTarget.x / distance,
     y: vectorToTarget.y / distance
   };
 
-  // 4. Calculate the force to apply
-  // The force magnitude needs to be enough to get him there in time.
-  // This requires tuning! We'll use our constant.
   const force = {
-    x: normalizedVector.x * KEEPER_REACTION_FORCE,
-    y: normalizedVector.y * KEEPER_REACTION_FORCE
+    x: normalizedVector.x * forceStrength,
+    y: normalizedVector.y * forceStrength
   };
 
-  // 5. Apply the force to the keeper's torso
-  // This gives him a powerful push towards the ball's destination.
+  // Apply the calculated force
   Body.applyForce(goalkeeper.torso, keeperPosition, force);
 
-  console.log(`Keeper reacting! Applying force {x: ${force.x.toFixed(4)}, y: ${force.y.toFixed(4)}}`);
-
-  // --- Future enhancements for this function ---
-  // - Apply upward force to feet for "jumping" if targetY is high.
-  // - Apply smaller forces to arms/hands to make them "reach".
+  console.log(`Keeper timing: Ball ETA ${ballTimeToTarget.toFixed(1)} frames, keeper distance ${keeperToTargetDistance.toFixed(1)}px, force strength ${forceStrength.toFixed(4)}`);
 }
 
 // OUR CUSTOM GAME LOOP / RENDERER
@@ -399,22 +1631,34 @@ function gameLoop() {
   ctx.fillStyle = '#e0f7fa'; // Light blue sky
   ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
-  // 3. Draw the goal image
+  // 3. Draw the goal image - responsive sizing with preserved aspect ratio
   if (goalImageLoaded) {
-    // Adjust x, y, width, height as needed to position and scale your goal image
-    // Example: Center the image, assuming its natural width is similar to GOAL_WIDTH
-    const goalDrawWidth = 250; // Or goalImage.width if you want natural size
-    const goalDrawHeight = 125; // Or goalImage.height
+    // Preserve goal's natural aspect ratio
+    const goalNaturalAspect = goalImage.width / goalImage.height;
+    const maxGoalWidth = CANVAS_WIDTH * 0.4; // Max 40% of canvas width
+    const maxGoalHeight = CANVAS_HEIGHT * 0.25; // Max 25% of canvas height
+
+    // Calculate size maintaining aspect ratio
+    let goalDrawWidth = maxGoalWidth;
+    let goalDrawHeight = goalDrawWidth / goalNaturalAspect;
+
+    // If height is too big, constrain by height instead
+    if (goalDrawHeight > maxGoalHeight) {
+      goalDrawHeight = maxGoalHeight;
+      goalDrawWidth = goalDrawHeight * goalNaturalAspect;
+    }
+
     const goalDrawX = (CANVAS_WIDTH - goalDrawWidth) / 2;
-    // Position it towards the top, an example:
-    const goalDrawY = CANVAS_HEIGHT * 0.2;
+    const goalDrawY = CANVAS_HEIGHT * 0.15; // 15% from top
     ctx.drawImage(goalImage, goalDrawX, goalDrawY, goalDrawWidth, goalDrawHeight);
   } else {
-    // Fallback if image not loaded
+    // Fallback if image not loaded - also responsive
+    const fallbackWidth = CANVAS_WIDTH * 0.3;
+    const fallbackHeight = CANVAS_HEIGHT * 0.15;
     ctx.fillStyle = '#DDDDDD';
-    ctx.fillRect((CANVAS_WIDTH - 200) / 2, CANVAS_HEIGHT * 0.2, 200, 100);
+    ctx.fillRect((CANVAS_WIDTH - fallbackWidth) / 2, CANVAS_HEIGHT * 0.15, fallbackWidth, fallbackHeight);
     ctx.fillStyle = 'black';
-    ctx.fillText("Goal Loading...", CANVAS_WIDTH / 2, CANVAS_HEIGHT * 0.2 + 50);
+    ctx.fillText("Goal Loading...", CANVAS_WIDTH / 2, CANVAS_HEIGHT * 0.2);
   }
 
   // 4. Animate and Draw Balls
@@ -436,12 +1680,20 @@ function gameLoop() {
       const animationSpeed = 5; // Pixels per frame, adjust for desired speed
 
       if (distanceToTarget < animationSpeed) {
-        // Reached target (or close enough) - this is the "SAVE" moment
+        // Reached save point - this is the "SAVE" moment
         Body.setPosition(body, { x: targetX, y: targetY });
         ballInfo.isShooting = false;
         ballInfo.currentScale = BALL_MIN_SCALE;
+        ballInfo.shotStartTime = 0; // Clear shot timing
 
-        console.log(`${ballInfo.id} reached save point. Deflecting from keeper.`);
+        console.log(`${ballInfo.id} reached save point. Keeper made the save!`);
+
+        // Create particle effect at the save moment!
+        createAerialAdjustmentEffect(targetX, targetY);
+        console.log('Save completed! Particle effect triggered at save point.');
+
+        // Show speech bubble with the solution for this problem
+        showSpeechBubble(ballInfo.solutionText);
 
         // --- ROBUST DEFLECTION LOGIC ---
         Body.setStatic(body, false);
@@ -485,6 +1737,9 @@ function gameLoop() {
         goalkeeper.isSaving = false;
         goalkeeper.reachTarget = null;
         goalkeeper.reachingHand = null;
+        // Return to ragdoll mode after save
+        goalkeeper.animationState = 'ragdoll';
+        goalkeeper.animationStartTime = 0;
 
         // 3. Temporarily disable collision between ball and keeper to prevent tangling
         body.collisionFilter.group = RAGDOLL_COLLISION_GROUP;
@@ -497,8 +1752,7 @@ function gameLoop() {
           }
         }, 500); // 500ms = half a second
 
-        // TODO: Replace problem text on this ball for the next shot.
-        // TODO: Show speech bubble with solution.
+        // No more queue processing needed!
 
       } else {
         // Move towards target
@@ -534,8 +1788,10 @@ function gameLoop() {
     ctx.stroke();
     ctx.closePath();
 
-    const isOutOfYBounds = body.position.y > CANVAS_HEIGHT + 50 || body.position.y < -50;
-    const isOutOfXBounds = body.position.x > CANVAS_WIDTH + 50 || body.position.x < -50;
+    // Ball reset bounds - generous but not too generous
+    const boundaryBuffer = 150; // Fixed buffer to avoid confusion
+    const isOutOfYBounds = body.position.y > CANVAS_HEIGHT + boundaryBuffer || body.position.y < -50;
+    const isOutOfXBounds = body.position.x > CANVAS_WIDTH + boundaryBuffer || body.position.x < -boundaryBuffer;
 
     if (!ballInfo.isShooting && (isOutOfYBounds || isOutOfXBounds)) {
       console.log(`Resetting ${ballInfo.id}`);
@@ -549,8 +1805,10 @@ function gameLoop() {
 
       // Reset visual/game state
       ballInfo.currentScale = 1;
+      ballInfo.shotStartTime = 0; // Clear shot timing
 
-      // TODO: Get new problem for this ball.
+      // Get new problem for this ball
+      assignNewProblem(ballInfo);
     }
   });
 
@@ -569,7 +1827,7 @@ function gameLoop() {
   }
   */
 
-  // 6. UPDATE KEEPER AI (e.g., Arm Stretching)
+  // 6. UPDATE KEEPER AI (e.g., Arm Stretching) - Simplified
   if (goalkeeper.isSaving && goalkeeper.reachTarget && goalkeeper.reachingHand) {
     const hand = goalkeeper.reachingHand;
     const target = goalkeeper.reachTarget;
@@ -588,6 +1846,45 @@ function gameLoop() {
     // Apply force to the "hand" (lower arm part)
     Body.applyForce(hand, hand.position, reachForce);
   }
+
+  // 6.1 KEEPER STANDING/RECOVERY FORCES
+  applyStandingForces();
+
+  // 6.2 ANTI-SPIN STABILIZATION - Prevent crazy spinning
+  preventKeeperSpinning();
+
+  // 6.3 ANIMATION STATE MANAGEMENT - Return to ragdoll after animation
+  updateAnimationState();
+
+  // 6.1 UPDATE SPEECH BUBBLE
+  if (speechBubble.isVisible) {
+    // Update opacity for fade in/out animation
+    if (speechBubble.opacity < speechBubble.targetOpacity) {
+      speechBubble.opacity = Math.min(speechBubble.targetOpacity, speechBubble.opacity + speechBubble.fadeSpeed);
+    } else if (speechBubble.opacity > speechBubble.targetOpacity) {
+      speechBubble.opacity = Math.max(speechBubble.targetOpacity, speechBubble.opacity - speechBubble.fadeSpeed);
+    }
+
+    // Check if we should start fading out
+    if (speechBubble.targetOpacity === 1 && Date.now() - speechBubble.showStartTime > speechBubble.displayDuration) {
+      hideSpeechBubble();
+    }
+
+    // Hide when fully faded out
+    if (speechBubble.opacity <= 0 && speechBubble.targetOpacity === 0) {
+      speechBubble.isVisible = false;
+    }
+  }
+
+  // 6.2 UPDATE PARTICLES
+  particles.forEach(particle => particle.update());
+  particles = particles.filter(particle => !particle.isDead());
+
+  // 6.3 CHECK GOALKEEPER BOUNDS
+  checkGoalkeeperBounds();
+
+  // 6.4 CHECK FOR STUCK BALLS
+  checkStuckBalls();
 
   // 7. Draw goalkeeper
   goalkeeper.bodies.forEach(body => {
@@ -610,12 +1907,101 @@ function gameLoop() {
     ctx.stroke();
   });
 
-  // 8. Draw UI elements like speech bubble (later)
+  // 7.1 Draw custom images on goalkeeper body parts
+  drawKeeperCustomizations();
+
+  // 8. Draw speech bubble
+  if (speechBubble.isVisible && speechBubble.opacity > 0 && goalkeeper.head) {
+    const headPos = goalkeeper.head.position;
+
+    // Position bubble above and to the side of the head
+    const bubbleX = headPos.x + 30;
+    const bubbleY = headPos.y - 40;
+    const bubbleWidth = 180;
+    const bubbleHeight = 60;
+    const cornerRadius = 8;
+
+    // Set opacity for fade effect
+    ctx.globalAlpha = speechBubble.opacity;
+
+    // Draw bubble background
+    ctx.fillStyle = '#FFFFFF';
+    ctx.strokeStyle = '#333333';
+    ctx.lineWidth = 2;
+
+    // Draw rounded rectangle for bubble
+    ctx.beginPath();
+    ctx.moveTo(bubbleX + cornerRadius, bubbleY);
+    ctx.arcTo(bubbleX + bubbleWidth, bubbleY, bubbleX + bubbleWidth, bubbleY + cornerRadius, cornerRadius);
+    ctx.arcTo(bubbleX + bubbleWidth, bubbleY + bubbleHeight, bubbleX + bubbleWidth - cornerRadius, bubbleY + bubbleHeight, cornerRadius);
+    ctx.arcTo(bubbleX, bubbleY + bubbleHeight, bubbleX, bubbleY + bubbleHeight - cornerRadius, cornerRadius);
+    ctx.arcTo(bubbleX, bubbleY, bubbleX + cornerRadius, bubbleY, cornerRadius);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+
+    // Draw speech bubble tail pointing to head
+    ctx.beginPath();
+    ctx.moveTo(bubbleX, bubbleY + bubbleHeight / 2);
+    ctx.lineTo(headPos.x + 10, headPos.y - 5);
+    ctx.lineTo(bubbleX, bubbleY + bubbleHeight / 2 + 10);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+
+    // Draw text
+    ctx.fillStyle = '#333333';
+    ctx.font = '12px Arial, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    // Wrap text if too long
+    const words = speechBubble.text.split(' ');
+    const lines = [];
+    let currentLine = '';
+    const maxWidth = bubbleWidth - 20; // Padding
+
+    words.forEach(word => {
+      const testLine = currentLine + (currentLine ? ' ' : '') + word;
+      const metrics = ctx.measureText(testLine);
+      if (metrics.width > maxWidth && currentLine) {
+        lines.push(currentLine);
+        currentLine = word;
+      } else {
+        currentLine = testLine;
+      }
+    });
+    if (currentLine) lines.push(currentLine);
+
+    // Draw each line
+    const lineHeight = 14;
+    const textStartY = bubbleY + bubbleHeight / 2 - (lines.length - 1) * lineHeight / 2;
+    lines.forEach((line, index) => {
+      ctx.fillText(line, bubbleX + bubbleWidth / 2, textStartY + index * lineHeight);
+    });
+
+    // Reset global alpha
+    ctx.globalAlpha = 1;
+  }
+
+  // 9. Draw particles (visual effects)
+  if (particles.length > 0) {
+    // Debug: Log particle count occasionally
+    if (Math.random() < 0.1) { // 10% chance to log
+      console.log(`Drawing ${particles.length} particles`);
+    }
+  }
+  particles.forEach(particle => particle.draw(ctx));
+
+  // 10. Draw other UI elements
 }
 
 
 // Initialization
-window.addEventListener('resize', resizeCanvas);
+window.addEventListener('resize', () => {
+  resizeCanvas();
+  handleResize();
+});
 
 function initializeScene() {
   ballsData.forEach((ball) => {
@@ -628,7 +2014,44 @@ function initializeScene() {
   resizeCanvas(); // Set canvas size first
   initPhysics();  // Setup Matter.js
   setupBallControls(); // Create HTML controls
+  setupMouseInteraction(); // Enable draggable keeper
   // gameLoop is now started by Events.on(engine, 'afterUpdate', gameLoop);
+}
+
+function setupMouseInteraction() {
+  // Mouse events
+  canvas.addEventListener('mousedown', handleMouseDown);
+  canvas.addEventListener('mousemove', handleMouseMove);
+  canvas.addEventListener('mouseup', handleMouseUp);
+  canvas.addEventListener('mouseleave', handleMouseUp); // Stop dragging if mouse leaves canvas
+
+  // Touch events for mobile
+  canvas.addEventListener('touchstart', (evt) => {
+    evt.preventDefault();
+    const touch = evt.touches[0];
+    const mouseEvent = new MouseEvent('mousedown', {
+      clientX: touch.clientX,
+      clientY: touch.clientY
+    });
+    handleMouseDown(mouseEvent);
+  });
+
+  canvas.addEventListener('touchmove', (evt) => {
+    evt.preventDefault();
+    const touch = evt.touches[0];
+    const mouseEvent = new MouseEvent('mousemove', {
+      clientX: touch.clientX,
+      clientY: touch.clientY
+    });
+    handleMouseMove(mouseEvent);
+  });
+
+  canvas.addEventListener('touchend', (evt) => {
+    evt.preventDefault();
+    handleMouseUp(evt);
+  });
+
+  console.log('Mouse interaction setup complete - keeper is now draggable!');
 }
 
 initializeScene();

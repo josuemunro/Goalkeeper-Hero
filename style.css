@@ -1,67 +1,88 @@
 body {
   margin: 0;
   font-family: sans-serif;
-  background-color: #f0f0f0; /* Light grey background for contrast */
+  background-color: #f0f0f0;
+  /* Light grey background for contrast */
   display: flex;
-  justify-content: center; /* Center the hero-section if it's not full width */
-  align-items: center; /* Vertically center content if desired, or remove */
-  min-height: 100vh; /* Ensure body takes full viewport height */
+  justify-content: center;
+  /* Center the hero-section if it's not full width */
+  align-items: center;
+  /* Vertically center content if desired, or remove */
+  min-height: 100vh;
+  /* Ensure body takes full viewport height */
 }
 
 .hero-section {
   width: 100%;
-  max-width: 1000px; /* Example: Max width for the entire hero area */
-  padding: 20px;
+  /* max-width: 1000px; */
+  /* Example: Max width for the entire hero area */
+  /* padding: 20px; */
   box-sizing: border-box;
-  background-color: #ffffff; /* White background for the hero section */
-  box-shadow: 0 0 10px rgba(0,0,0,0.1);
+  background-color: #ffffff;
+  /* White background for the hero section */
+  box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
 }
 
 .canvas-container {
-  width: 100%; /* Take full width of its parent (.hero-section) initially */
-  /* As per brief: "aim for a width of around 600px (or 100% of its parent container if smaller)" */
-  /* We can enforce the 600px max-width more specifically here or let the parent .hero-section handle it. */
-  /* For now, let's make it a percentage of the .hero-section, aiming for the 40% mentioned */
-  max-width: 600px; /* Max width of the canvas area itself */
-  /* If .hero-section is 1000px, 40% would be 400px. If 600px is desired, this could be:
-     width: 60%; max-width: 600px; (if hero-section is 1000px)
-     Let's make it flexible for now. This will contain the canvas.
-  */
-  margin: 0 auto; /* Center the canvas container within the hero-section */
-  border: 1px solid #ccc; /* A light border to see the canvas area */
+  width: 100%;
+  /* Full width without scrollbar issues */
+  height: 75vh;
+  /* 75% of viewport height */
+  max-width: none;
+  /* Remove max-width constraint for full screen */
+  margin: 0;
+  /* Remove auto centering */
+  border: 1px solid #ccc;
+  /* Keep border for now to see canvas area */
+  position: relative;
+  /* For absolute positioning if needed */
 }
 
 #gameCanvas {
-  display: block; /* Removes extra space below the canvas */
-  width: 100%;    /* Make canvas responsive within its container */
-  height: auto;   /* Maintain aspect ratio based on width, or set fixed height */
+  display: block;
+  /* Removes extra space below the canvas */
+  width: 100%;
+  /* Make canvas responsive within its container */
+  height: 100%;
+  /* Fill container height instead of auto */
   /* We will set the actual drawing dimensions (canvas.width, canvas.height) in JS */
-  /* For now, this CSS makes it scale visually. */
-  background-color: #e0f7fa; /* Light blue, like a sky, for the canvas background */
+  /* Canvas will scale to fill the full viewport space */
+  background-color: #e0f7fa;
+  /* Light blue, like a sky, for the canvas background */
 }
 
 /* ... (previous styles) ... */
 
 #ball-controls-container {
-  display: flex; /* Arrange ball controls horizontally */
-  justify-content: center; /* Center the controls */
-  align-items: flex-start; /* Align items to the top */
-  flex-wrap: wrap; /* Allow wrapping on smaller screens if needed */
+  display: flex;
+  /* Arrange ball controls horizontally */
+  justify-content: center;
+  /* Center the controls */
+  align-items: flex-start;
+  /* Align items to the top */
+  flex-wrap: wrap;
+  /* Allow wrapping on smaller screens if needed */
   padding: 15px 0;
-  max-width: 600px; /* Match canvas container max-width */
-  margin: 0 auto; /* Center the container */
+  max-width: 600px;
+  /* Match canvas container max-width */
+  margin: 0 auto;
+  /* Center the container */
 }
 
 .ball-control {
   display: flex;
-  flex-direction: column; /* Stack problem text above button */
-  align-items: center; /* Center items horizontally */
-  margin: 0 10px; /* Spacing between ball controls */
+  flex-direction: column;
+  /* Stack problem text above button */
+  align-items: center;
+  /* Center items horizontally */
+  margin: 0 10px;
+  /* Spacing between ball controls */
   padding: 10px;
   background-color: #f9f9f9;
   border-radius: 8px;
-  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-  min-width: 120px; /* Give some minimum width to each control block */
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  min-width: 120px;
+  /* Give some minimum width to each control block */
   text-align: center;
 }
 
@@ -69,7 +90,8 @@ body {
   font-size: 14px;
   color: #333;
   margin-bottom: 10px;
-  min-height: 40px; /* Ensure space for a couple of lines of text */
+  min-height: 40px;
+  /* Ensure space for a couple of lines of text */
   display: flex;
   align-items: center;
   justify-content: center;
@@ -79,7 +101,8 @@ body {
   padding: 8px 15px;
   font-size: 14px;
   color: white;
-  background-color: #4CAF50; /* Green */
+  background-color: #4CAF50;
+  /* Green */
   border: none;
   border-radius: 5px;
   cursor: pointer;
@@ -87,5 +110,46 @@ body {
 }
 
 .ball-control .shoot-button:hover {
-  background-color: #45a049; /* Darker green */
+  background-color: #45a049;
+  /* Darker green */
+}
+
+/* Mobile Responsiveness */
+@media screen and (max-width: 480px) {
+  .hero-section {
+    padding: 10px;
+    max-width: 100%;
+  }
+
+  .canvas-container {
+    max-width: 100%;
+    margin: 0;
+  }
+
+  #gameCanvas {
+    max-height: 350px;
+    /* Prevent canvas from being too tall on mobile */
+  }
+
+  #ball-controls-container {
+    max-width: 100%;
+    padding: 10px 0;
+  }
+
+  .ball-control {
+    margin: 0 5px;
+    min-width: 100px;
+    flex: 1;
+    /* Make mobile controls take equal space */
+  }
+
+  .ball-control .problem-text {
+    font-size: 12px;
+    min-height: 35px;
+  }
+
+  .ball-control .shoot-button {
+    padding: 10px 12px;
+    font-size: 13px;
+  }
 }
